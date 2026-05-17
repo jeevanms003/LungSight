@@ -209,26 +209,32 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     
     model = get_model(architecture).to(device)
     
-    # Configure training parameters and gradients:
-    # 1. SimpleCNN trains from scratch, so all parameters must be trainable.
-    # 2. Pretrained models (ResNet-18, MobileNet-V2, DenseNet-121) freeze the backbone to speed up training
-    #    by 3x-5x (extremely useful on CPU) and keep pretrained ImageNet features stable.
+    # Ensure ALL parameters are fully trainable (requires_grad = True) so the backbone adapts to X-ray details
+    for param in model.parameters():
+        param.requires_grad = True
+        
+    # Configure optimizer with differential learning rates for pretrained models
     if architecture == "Simple CNN":
-        for param in model.parameters():
-            param.requires_grad = True
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     else:
+        # Pretrained models: ResNet-18, MobileNet-V2, DenseNet-121
+        # Set up differential learning rates: 1e-5 for backbone (slow, stable fine-tuning), 1e-3 for classifier (fast learning)
+        backbone_params = []
+        classifier_params = []
+        
+        # Identify the classifier layer name
         classifier_name = "fc" if architecture == "ResNet-18" else "classifier"
         
         for name, param in model.named_parameters():
             if classifier_name in name:
-                param.requires_grad = True
+                classifier_params.append(param)
             else:
-                param.requires_grad = False
+                backbone_params.append(param)
                 
-        # Optimize only the trainable classifier head parameters
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
+        optimizer = torch.optim.Adam([
+            {"params": backbone_params, "lr": 1e-5},
+            {"params": classifier_params, "lr": 1e-3}
+        ])
         
     # Calculate positive weights for highly imbalanced datasets to boost F1-Score (capped at 10.0 for stability)
     pos_counts = torch.zeros(len(ALL_LABELS))
@@ -248,16 +254,8 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     history = {"loss": [], "accuracy": [], "architecture": architecture}
     
     for epoch in progress.tqdm(range(int(epochs)), desc="Epochs"):
-        # CRITICAL FIX: If backbone is frozen, keep it in eval() to prevent BatchNorm statistics corruption,
-        # while only setting the classification head to train() to let Dropout run!
-        if architecture == "Simple CNN":
-            model.train()
-        else:
-            model.eval()
-            if architecture == "ResNet-18":
-                model.fc.train()
-            else:
-                model.classifier.train()
+        # Put entire model in train mode to allow both backbone fine-tuning and dropout regularization
+        model.train()
         running_loss = 0.0
         correct = 0
         total = 0
