@@ -221,7 +221,9 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         history["loss"].append(epoch_loss)
         history["accuracy"].append(epoch_acc)
         
-        msg = f"Epoch [{epoch+1}/{epochs}] - Loss: {epoch_loss:.4f}, Accuracy (Avg Binary): {epoch_acc:.4f}"
+        msg = f"Epoch [{epoch+1}/{epochs}] -\n"
+        msg += f"  -> Current Training Loss: {epoch_loss:.4f}\n"
+        msg += f"  -> Current Training Accuracy: {epoch_acc * 100:.2f}%\n"
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update()
