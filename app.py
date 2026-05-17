@@ -192,7 +192,7 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         
     criterion = nn.BCEWithLogitsLoss()
     
-    history = {"loss": [], "accuracy": [], "f1_score": [], "architecture": architecture}
+    history = {"loss": [], "accuracy": [], "architecture": architecture}
     
     for epoch in progress.tqdm(range(int(epochs)), desc="Epochs"):
         model.train()
@@ -225,21 +225,18 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             fn += ((preds == 0) & (labels == 1)).float().sum().item()
             
         epoch_loss = running_loss / (total / len(ALL_LABELS))
-        epoch_acc = correct / total
         
-        # Calculate Micro F1-Score
+        # Calculate Micro F1-Score (uninflated disease detection metric)
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
         epoch_f1 = 2 * precision * recall / (precision + recall + 1e-8)
         
         history["loss"].append(epoch_loss)
-        history["accuracy"].append(epoch_acc)
-        history["f1_score"].append(epoch_f1)
+        history["accuracy"].append(epoch_f1)  # Use F1-Score as the primary Accuracy!
         
         msg = f"Epoch [{epoch+1}/{epochs}] -\n"
         msg += f"  -> Current Training Loss: {epoch_loss:.4f}\n"
-        msg += f"  -> Current Training Accuracy: {epoch_acc * 100:.2f}%\n"
-        msg += f"  -> Current F1-Score (Disease Detection): {epoch_f1 * 100:.2f}%\n"
+        msg += f"  -> Current Training Accuracy (F1-Score): {epoch_f1 * 100:.2f}%\n"
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update()
@@ -278,23 +275,28 @@ def get_performance(model_name):
     ax1.set_ylabel("Loss")
     ax1.grid(True, linestyle='--', alpha=0.5)
     
-    ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='orange', linewidth=2, label="Binary Accuracy")
+    # Backward compatibility: Check if this was trained under the old scheme
     if "f1_score" in history:
-        ax2.plot(epochs, [f * 100 for f in history["f1_score"]], marker='s', color='green', linewidth=2, label="F1-Score (Disease Detection)")
+        # Plot F1-score as primary line, and show binary accuracy as comparison
+        ax2.plot(epochs, [f * 100 for f in history["f1_score"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
+        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='x', linestyle='--', color='gray', alpha=0.6, label="Binary Accuracy (Old)")
+        final_acc = history["f1_score"][-1]
+    else:
+        # New scheme: history["accuracy"] is F1-score itself!
+        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
+        final_acc = history["accuracy"][-1]
         
-    ax2.set_title("Training Performance Metrics")
+    ax2.set_title("Training Accuracy (F1-Score)")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Percentage (%)")
+    ax2.set_ylabel("Accuracy (%)")
     ax2.legend(loc="lower right")
     ax2.grid(True, linestyle='--', alpha=0.5)
     
     plt.tight_layout()
     
     final_loss = history["loss"][-1]
-    final_acc = history["accuracy"][-1]
-    final_f1 = history.get("f1_score", [0.0])[-1]
     arch = history.get("architecture", "Unknown")
-    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Accuracy: {final_acc*100:.2f}% | Final F1-Score: {final_f1*100:.2f}%"
+    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Accuracy (F1-Score): {final_acc*100:.2f}%"
     
     return fig, stats
 
