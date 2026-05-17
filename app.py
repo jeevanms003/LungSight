@@ -35,12 +35,32 @@ class SimpleCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # 112x112
+            
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # 56x56
+            
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # 28x28
+            
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # 14x14
+            
+            nn.AdaptiveAvgPool2d((1, 1)) # 1x1
         )
-        self.classifier = nn.Linear(64, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(256, num_classes)
+        )
     def forward(self, x):
         x = self.features(x)
         x = torch.flatten(x, 1)
@@ -93,7 +113,7 @@ class NIHDataset(Dataset):
             
         return img, label_tensor
 
-def train_model(model_name, architecture, epochs, batch_size, num_images, selected_diseases, balanced_sampling, progress=gr.Progress()):
+def train_model(model_name, architecture, epochs, batch_size, selected_diseases, balanced_sampling, balanced_size, progress=gr.Progress()):
     if not model_name:
         model_name = f"model_{int(time.time())}"
         
@@ -104,12 +124,13 @@ def train_model(model_name, architecture, epochs, batch_size, num_images, select
     
     if selected_diseases:
         if balanced_sampling:
-            log_text += f"Using Balanced Sampling: 200 images for each of the {len(selected_diseases)} selected diseases...\n"
+            sample_size = int(balanced_size)
+            log_text += f"Using Balanced Sampling: {sample_size} images for each of the {len(selected_diseases)} selected diseases...\n"
             yield log_text, gr.update()
             dfs = []
             for d in selected_diseases:
                 d_df = df[df['Finding Labels'].str.contains(d)].copy()
-                sample_n = min(len(d_df), 200)
+                sample_n = min(len(d_df), sample_size)
                 if sample_n > 0:
                     dfs.append(d_df.sort_values(['Patient ID', 'Follow-up #']).head(sample_n))
             if dfs:
@@ -119,15 +140,14 @@ def train_model(model_name, architecture, epochs, batch_size, num_images, select
                 yield log_text, update_model_dropdown()
                 return
         else:
+            log_text += f"Using all matching images for the selected diseases...\n"
+            yield log_text, gr.update()
             mask = df['Finding Labels'].apply(lambda x: any(d in x for d in selected_diseases))
             df = df[mask].reset_index(drop=True)
-            num_to_sample = int(num_images) if str(num_images).isdigit() else len(df)
-            if num_to_sample < len(df):
-                df = df.sort_values(['Patient ID', 'Follow-up #']).head(num_to_sample).reset_index(drop=True)
     else:
-        num_to_sample = int(num_images) if str(num_images).isdigit() else len(df)
-        if num_to_sample < len(df):
-            df = df.sort_values(['Patient ID', 'Follow-up #']).head(num_to_sample).reset_index(drop=True)
+        log_text += f"No diseases selected. Training on the entire dataset of {len(df)} images...\n"
+        yield log_text, gr.update()
+        df = df.reset_index(drop=True)
         
     msg = f"Training on {len(df)} images for {epochs} epochs with batch size {batch_size}."
     print(msg)
@@ -148,8 +168,19 @@ def train_model(model_name, architecture, epochs, batch_size, num_images, select
     yield log_text, gr.update()
     
     model = get_model(architecture).to(device)
+    
+    # Ensure all parameters have requires_grad set to True
+    for param in model.parameters():
+        param.requires_grad = True
+        
     criterion = nn.BCEWithLogitsLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    
+    # SimpleCNN trains from scratch so it needs a higher learning rate (1e-3) to converge quickly.
+    # Pretrained models (ResNet-18, MobileNet-V2, DenseNet-121) use 1e-4 for fine-tuning stability.
+    if architecture == "Simple CNN":
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     
     history = {"loss": [], "accuracy": [], "architecture": architecture}
     
@@ -171,15 +202,16 @@ def train_model(model_name, architecture, epochs, batch_size, num_images, select
             running_loss += loss.item() * inputs.size(0)
             
             preds = (torch.sigmoid(outputs) > 0.5).float()
-            correct += (preds == labels).all(dim=1).float().sum().item()
-            total += inputs.size(0)
+            # Calculate standard average binary accuracy per label (proper multi-label metric)
+            correct += (preds == labels).float().sum().item()
+            total += inputs.size(0) * len(ALL_LABELS)
             
-        epoch_loss = running_loss / total
+        epoch_loss = running_loss / (total / len(ALL_LABELS))
         epoch_acc = correct / total
         history["loss"].append(epoch_loss)
         history["accuracy"].append(epoch_acc)
         
-        msg = f"Epoch [{epoch+1}/{epochs}] - Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}"
+        msg = f"Epoch [{epoch+1}/{epochs}] - Loss: {epoch_loss:.4f}, Accuracy (Avg Binary): {epoch_acc:.4f}"
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update()
@@ -218,7 +250,7 @@ def get_performance(model_name):
     ax1.set_ylabel("Loss")
     
     ax2.plot(epochs, history["accuracy"], marker='o', color='orange')
-    ax2.set_title("Training Accuracy (Exact Match)")
+    ax2.set_title("Training Accuracy (Average Binary)")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Accuracy")
     
@@ -227,7 +259,7 @@ def get_performance(model_name):
     final_loss = history["loss"][-1]
     final_acc = history["accuracy"][-1]
     arch = history.get("architecture", "Unknown")
-    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Accuracy: {final_acc:.4f}"
+    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Avg Binary Accuracy: {final_acc:.4f}"
     
     return fig, stats
 
@@ -281,8 +313,8 @@ with gr.Blocks() as demo:
             epochs_input = gr.Slider(minimum=1, maximum=50, value=3, step=1, label="Epochs")
             batch_size_input = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="Batch Size")
         with gr.Row():
-            num_images_input = gr.Dropdown(choices=["100", "500", "1000", "5000", "10000", "All"], value="1000", label="Total Images (if Balanced Sampling is OFF)")
-            balanced_input = gr.Checkbox(label="Enable Balanced Sampling (200 images per selected disease)", value=True)
+            balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
+            balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
         with gr.Row():
             diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
             
@@ -303,9 +335,14 @@ with gr.Blocks() as demo:
             prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
         predict_btn = gr.Button("Predict Disease", variant="primary")
         
+    def toggle_balanced_size(balanced):
+        return gr.update(visible=balanced)
+        
+    balanced_input.change(fn=toggle_balanced_size, inputs=[balanced_input], outputs=[balanced_size_input])
+    
     train_btn.click(
         fn=train_model, 
-        inputs=[model_name_input, architecture_input, epochs_input, batch_size_input, num_images_input, diseases_input, balanced_input], 
+        inputs=[model_name_input, architecture_input, epochs_input, batch_size_input, diseases_input, balanced_input, balanced_size_input], 
         outputs=[train_output, model_dropdown]
     )
     
