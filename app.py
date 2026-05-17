@@ -169,18 +169,28 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     
     model = get_model(architecture).to(device)
     
-    # Ensure all parameters have requires_grad set to True
-    for param in model.parameters():
-        param.requires_grad = True
-        
-    criterion = nn.BCEWithLogitsLoss()
-    
-    # SimpleCNN trains from scratch so it needs a higher learning rate (1e-3) to converge quickly.
-    # Pretrained models (ResNet-18, MobileNet-V2, DenseNet-121) use 1e-4 for fine-tuning stability.
+    # Configure training parameters and gradients:
+    # 1. SimpleCNN trains from scratch, so all parameters must be trainable.
+    # 2. Pretrained models (ResNet-18, MobileNet-V2, DenseNet-121) freeze the backbone to speed up training
+    #    by 3x-5x (extremely useful on CPU) and keep pretrained ImageNet features stable.
     if architecture == "Simple CNN":
+        for param in model.parameters():
+            param.requires_grad = True
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        classifier_name = "fc" if architecture == "ResNet-18" else "classifier"
+        
+        for name, param in model.named_parameters():
+            if classifier_name in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+                
+        # Optimize only the trainable classifier head parameters
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
+        
+    criterion = nn.BCEWithLogitsLoss()
     
     history = {"loss": [], "accuracy": [], "architecture": architecture}
     
