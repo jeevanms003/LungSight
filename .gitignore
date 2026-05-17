@@ -1,0 +1,23 @@
+# Ignore dataset image directories
+images_0*/
+images_1*/
+images_*/
+
+# Ignore model saves and training histories
+models/
+*.pth
+*_metrics.json
+
+# Python caches and system files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Ignore large documentation PDF files
+*.pdf
