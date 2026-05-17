@@ -31,6 +31,40 @@ for i in range(1, 13):
         all_image_paths[os.path.basename(p)] = p
 print(f"Loaded {len(all_image_paths)} image paths.")
 
+def load_compat_state_dict(model, state_dict):
+    """
+    Loads state_dict into model, dynamically adapting between older format (nn.Linear)
+    and newer format (nn.Sequential(nn.Dropout, nn.Linear)).
+    """
+    model_state = model.state_dict()
+    new_state = {}
+    for k, v in state_dict.items():
+        if k.startswith("fc."):
+            if k == "fc.weight" and "fc.1.weight" in model_state:
+                new_state["fc.1.weight"] = v
+            elif k == "fc.bias" and "fc.1.bias" in model_state:
+                new_state["fc.1.bias"] = v
+            elif k == "fc.1.weight" and "fc.weight" in model_state:
+                new_state["fc.weight"] = v
+            elif k == "fc.1.bias" and "fc.bias" in model_state:
+                new_state["fc.bias"] = v
+            else:
+                new_state[k] = v
+        elif k.startswith("classifier."):
+            if k == "classifier.weight" and "classifier.1.weight" in model_state:
+                new_state["classifier.1.weight"] = v
+            elif k == "classifier.bias" and "classifier.1.bias" in model_state:
+                new_state["classifier.1.bias"] = v
+            elif k == "classifier.1.weight" and "classifier.weight" in model_state:
+                new_state["classifier.weight"] = v
+            elif k == "classifier.1.bias" and "classifier.bias" in model_state:
+                new_state["classifier.bias"] = v
+            else:
+                new_state[k] = v
+        else:
+            new_state[k] = v
+    model.load_state_dict(new_state, strict=False)
+
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -74,12 +108,18 @@ def get_model(model_type="ResNet-18"):
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
     elif model_type == "DenseNet-121":
         model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
-        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
+        model.classifier = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(model.classifier.in_features, num_classes)
+        )
     elif model_type == "Simple CNN":
         model = SimpleCNN(num_classes)
     else: # Default ResNet-18
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        model.fc = nn.Linear(model.fc.in_features, num_classes)
+        model.fc = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(model.fc.in_features, num_classes)
+        )
     return model
 
 class NIHDataset(Dataset):
@@ -190,12 +230,34 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.Adam(trainable_params, lr=1e-3)
         
-    criterion = nn.BCEWithLogitsLoss()
+    # Calculate positive weights for highly imbalanced datasets to boost F1-Score (capped at 10.0 for stability)
+    pos_counts = torch.zeros(len(ALL_LABELS))
+    for labels_str in df['Finding Labels']:
+        labels = labels_str.split('|')
+        for i, l in enumerate(ALL_LABELS):
+            if l in labels:
+                pos_counts[i] += 1
+                
+    pos_weight = torch.ones(len(ALL_LABELS))
+    for i in range(len(ALL_LABELS)):
+        if pos_counts[i] > 0:
+            pos_weight[i] = min((len(df) - pos_counts[i]) / pos_counts[i], 10.0)
+            
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     
     history = {"loss": [], "accuracy": [], "architecture": architecture}
     
     for epoch in progress.tqdm(range(int(epochs)), desc="Epochs"):
-        model.train()
+        # CRITICAL FIX: If backbone is frozen, keep it in eval() to prevent BatchNorm statistics corruption,
+        # while only setting the classification head to train() to let Dropout run!
+        if architecture == "Simple CNN":
+            model.train()
+        else:
+            model.eval()
+            if architecture == "ResNet-18":
+                model.fc.train()
+            else:
+                model.classifier.train()
         running_loss = 0.0
         correct = 0
         total = 0
@@ -319,7 +381,7 @@ def predict_image(image, model_name):
         
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = get_model(arch)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    load_compat_state_dict(model, torch.load(model_path, map_location=device))
     model.to(device)
     model.eval()
     
