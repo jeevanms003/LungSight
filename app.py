@@ -582,10 +582,16 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
             params = model.parameters()
             if opt_name == "Adam":
                 optimizer = torch.optim.Adam(params, lr=classifier_lr)
+            elif opt_name == "AdamW":
+                optimizer = torch.optim.AdamW(params, lr=classifier_lr)
             elif opt_name == "SGD":
                 optimizer = torch.optim.SGD(params, lr=classifier_lr, momentum=0.9)
-            else:
+            elif opt_name == "RMSprop":
                 optimizer = torch.optim.RMSprop(params, lr=classifier_lr)
+            elif opt_name == "Adagrad":
+                optimizer = torch.optim.Adagrad(params, lr=classifier_lr)
+            else:
+                optimizer = torch.optim.Adam(params, lr=classifier_lr)
         else:
             backbone_params = []
             classifier_params = []
@@ -601,13 +607,28 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
                     {"params": backbone_params, "lr": backbone_lr},
                     {"params": classifier_params, "lr": classifier_lr}
                 ])
+            elif opt_name == "AdamW":
+                optimizer = torch.optim.AdamW([
+                    {"params": backbone_params, "lr": backbone_lr},
+                    {"params": classifier_params, "lr": classifier_lr}
+                ])
             elif opt_name == "SGD":
                 optimizer = torch.optim.SGD([
                     {"params": backbone_params, "lr": backbone_lr},
                     {"params": classifier_params, "lr": classifier_lr}
                 ], momentum=0.9)
-            else:
+            elif opt_name == "RMSprop":
                 optimizer = torch.optim.RMSprop([
+                    {"params": backbone_params, "lr": backbone_lr},
+                    {"params": classifier_params, "lr": classifier_lr}
+                ])
+            elif opt_name == "Adagrad":
+                optimizer = torch.optim.Adagrad([
+                    {"params": backbone_params, "lr": backbone_lr},
+                    {"params": classifier_params, "lr": classifier_lr}
+                ])
+            else:
+                optimizer = torch.optim.Adam([
                     {"params": backbone_params, "lr": backbone_lr},
                     {"params": classifier_params, "lr": classifier_lr}
                 ])
@@ -758,7 +779,7 @@ with gr.Blocks() as demo:
                 optuna_trials_input = gr.Slider(minimum=1, maximum=50, value=5, step=1, label="Number of Trials")
                 optuna_epochs_input = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Epochs per Trial")
                 optuna_archs_input = gr.CheckboxGroup(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value=["ResNet-18", "MobileNet-V2"], label="Base Architectures to Search")
-                optuna_opts_input = gr.CheckboxGroup(choices=["Adam", "SGD", "RMSprop"], value=["Adam", "SGD"], label="Optimizers to Search")
+                optuna_opts_input = gr.CheckboxGroup(choices=["Adam", "AdamW", "SGD", "RMSprop", "Adagrad"], value=["Adam", "AdamW", "SGD"], label="Optimizers to Search")
                 optuna_batch_input = gr.CheckboxGroup(choices=["8", "16", "32"], value=["16", "32"], label="Batch Sizes to Search")
             with gr.Column():
                 optuna_balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
