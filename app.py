@@ -101,6 +101,39 @@ class SimpleCNN(nn.Module):
         x = self.classifier(x)
         return x
 
+class HybridModel(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.resnet_features = nn.Sequential(*list(self.resnet.children())[:-1])
+        
+        self.mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
+        self.mobilenet_features = self.mobilenet.features
+        
+        self.densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+        self.densenet_features = self.densenet.features
+        
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(512 + 1280 + 1024, num_classes)
+        )
+        
+    def forward(self, x):
+        r_feat = self.resnet_features(x)
+        r_feat = torch.flatten(r_feat, 1)
+        
+        m_feat = self.mobilenet_features(x)
+        m_feat = self.pool(m_feat)
+        m_feat = torch.flatten(m_feat, 1)
+        
+        d_feat = self.densenet_features(x)
+        d_feat = self.pool(d_feat)
+        d_feat = torch.flatten(d_feat, 1)
+        
+        combined = torch.cat((r_feat, m_feat, d_feat), dim=1)
+        return self.classifier(combined)
+
 def get_model(model_type="ResNet-18"):
     num_classes = len(ALL_LABELS)
     if model_type == "MobileNet-V2":
@@ -114,6 +147,8 @@ def get_model(model_type="ResNet-18"):
         )
     elif model_type == "Simple CNN":
         model = SimpleCNN(num_classes)
+    elif model_type == "Hybrid Model":
+        model = HybridModel(num_classes)
     else: # Default ResNet-18
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         model.fc = nn.Sequential(
@@ -219,6 +254,18 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     # Configure optimizer with differential learning rates for pretrained models
     if architecture == "Simple CNN":
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    elif architecture == "Hybrid Model":
+        backbone_params = []
+        classifier_params = []
+        for name, param in model.named_parameters():
+            if "classifier" in name:
+                classifier_params.append(param)
+            else:
+                backbone_params.append(param)
+        optimizer = torch.optim.Adam([
+            {"params": backbone_params, "lr": 1e-5},
+            {"params": classifier_params, "lr": 1e-3}
+        ])
     else:
         # Pretrained models: ResNet-18, MobileNet-V2, DenseNet-121
         # Set up differential learning rates: 1e-5 for backbone (slow, stable fine-tuning), 1e-3 for classifier (fast learning)
@@ -376,9 +423,12 @@ def predict_image(image, model_name):
     
     arch = "ResNet-18"
     if os.path.exists(metrics_path):
-        with open(metrics_path, "r") as f:
-            meta = json.load(f)
-            arch = meta.get("architecture", "ResNet-18")
+        try:
+            with open(metrics_path, "r") as f:
+                meta = json.load(f)
+                arch = meta.get("architecture", "ResNet-18")
+        except:
+            pass
         
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = get_model(arch)
@@ -391,12 +441,14 @@ def predict_image(image, model_name):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
+    image = image.convert('RGB')
     img_t = transform(image).unsqueeze(0).to(device)
     
     with torch.no_grad():
         outputs = model(img_t)
         probs = torch.sigmoid(outputs).squeeze().cpu().numpy()
+        if probs.ndim == 0:
+            probs = [probs.item()]
         
     results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
     return results
@@ -408,7 +460,7 @@ with gr.Blocks() as demo:
     with gr.Tab("1. Train Model"):
         with gr.Row():
             model_name_input = gr.Textbox(label="Model Name (optional)", placeholder="my_resnet")
-            architecture_input = gr.Dropdown(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN"], value="ResNet-18", label="Base Architecture")
+            architecture_input = gr.Dropdown(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value="ResNet-18", label="Base Architecture")
         with gr.Row():
             epochs_input = gr.Slider(minimum=1, maximum=50, value=3, step=1, label="Epochs")
             batch_size_input = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="Batch Size")
@@ -416,7 +468,11 @@ with gr.Blocks() as demo:
             balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
             balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
         with gr.Row():
-            diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
+            with gr.Column():
+                diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
+                with gr.Row():
+                    select_all_btn = gr.Button("Select All")
+                    deselect_all_btn = gr.Button("Clear Selection")
             
         train_btn = gr.Button("Train Model", variant="primary")
         train_output = gr.Textbox(label="Live Terminal Output", lines=10, max_lines=20)
@@ -439,6 +495,9 @@ with gr.Blocks() as demo:
         return gr.update(visible=balanced)
         
     balanced_input.change(fn=toggle_balanced_size, inputs=[balanced_input], outputs=[balanced_size_input])
+    
+    select_all_btn.click(fn=lambda: gr.update(value=ALL_LABELS), outputs=diseases_input)
+    deselect_all_btn.click(fn=lambda: gr.update(value=[]), outputs=diseases_input)
     
     train_btn.click(
         fn=train_model, 
