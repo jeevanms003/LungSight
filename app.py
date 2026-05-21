@@ -13,6 +13,11 @@ import matplotlib.pyplot as plt
 import io
 import time
 
+try:
+    import optuna
+except ImportError:
+    optuna = None
+
 DATA_DIR = r"d:\NIH_Chest_Xray_Project"
 CSV_PATH = os.path.join(DATA_DIR, "Data_Entry_2017.csv")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
@@ -410,6 +415,261 @@ def get_performance(model_name):
     
     return fig, stats
 
+def evaluate_model(model, dataloader, device):
+    model.eval()
+    tp, fp, fn = 0, 0, 0
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            preds = (torch.sigmoid(outputs) > 0.5).float()
+            tp += ((preds == 1) & (labels == 1)).float().sum().item()
+            fp += ((preds == 1) & (labels == 0)).float().sum().item()
+            fn += ((preds == 0) & (labels == 1)).float().sum().item()
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    return f1
+
+def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, selected_optimizers, selected_batch_sizes, selected_diseases, balanced_sampling, balanced_size, progress=gr.Progress()):
+    if optuna is None:
+        yield "Error: Optuna library is not installed. Please run 'pip install optuna' to enable hyperparameter tuning.", gr.update(), None
+        return
+        
+    if not selected_architectures:
+        yield "Error: Please select at least one base architecture to search over.", gr.update(), None
+        return
+        
+    if not selected_optimizers:
+        yield "Error: Please select at least one optimizer to search over.", gr.update(), None
+        return
+        
+    if not selected_batch_sizes:
+        yield "Error: Please select at least one batch size to search over.", gr.update(), None
+        return
+
+    log_text = f"Starting Optuna Hyperparameter Optimization Study...\n"
+    log_text += f"Config: Trials={num_trials}, Epochs per Trial={epochs_per_trial}\n"
+    log_text += f"Architectures to evaluate: {selected_architectures}\n"
+    log_text += f"Optimizers to evaluate: {selected_optimizers}\n"
+    log_text += f"Batch Sizes to evaluate: {selected_batch_sizes}\n"
+    yield log_text, gr.update(), None
+    
+    df = pd.read_csv(CSV_PATH)
+    df = df[df['Image Index'].isin(all_image_paths.keys())].reset_index(drop=True)
+    
+    if selected_diseases:
+        if balanced_sampling:
+            sample_size = int(balanced_size)
+            log_text += f"Using Balanced Sampling: {sample_size} images per selected disease...\n"
+            yield log_text, gr.update(), None
+            dfs = []
+            for d in selected_diseases:
+                d_df = df[df['Finding Labels'].str.contains(d)].copy()
+                sample_n = min(len(d_df), sample_size)
+                if sample_n > 0:
+                    dfs.append(d_df.sort_values(['Patient ID', 'Follow-up #']).head(sample_n))
+            if dfs:
+                df = pd.concat(dfs).drop_duplicates().reset_index(drop=True)
+            else:
+                yield log_text + "No images found for the selected diseases.\n", gr.update(), None
+                return
+        else:
+            log_text += "Using all matching images for target diseases...\n"
+            yield log_text, gr.update(), None
+            mask = df['Finding Labels'].apply(lambda x: any(d in x for d in selected_diseases))
+            df = df[mask].reset_index(drop=True)
+    else:
+        log_text += f"No target diseases specified. Running optimization on full dataset of {len(df)} images...\n"
+        yield log_text, gr.update(), None
+        
+    if len(df) < 5:
+        yield log_text + f"Error: Dataset size too small ({len(df)} images). Please select more diseases or increase sampling size.\n", gr.update(), None
+        return
+        
+    # Train/Validation Split (80% / 20%)
+    train_df = df.sample(frac=0.8, random_state=42)
+    val_df = df.drop(train_df.index).reset_index(drop=True)
+    train_df = train_df.reset_index(drop=True)
+    
+    log_text += f"Split details: {len(train_df)} training samples, {len(val_df)} validation samples.\n"
+    yield log_text, gr.update(), None
+    
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    log_text += f"Running on device: {device}\n"
+    yield log_text, gr.update(), None
+    
+    # Calculate loss weights
+    pos_counts = torch.zeros(len(ALL_LABELS))
+    for labels_str in train_df['Finding Labels']:
+        labels = labels_str.split('|')
+        for i, l in enumerate(ALL_LABELS):
+            if l in labels:
+                pos_counts[i] += 1
+                
+    pos_weight = torch.ones(len(ALL_LABELS))
+    for i in range(len(ALL_LABELS)):
+        if pos_counts[i] > 0:
+            pos_weight[i] = min((len(train_df) - pos_counts[i]) / pos_counts[i], 10.0)
+            
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    
+    # Optuna study Setup
+    study = optuna.create_study(direction="maximize")
+    
+    for trial_idx in range(int(num_trials)):
+        trial = study.ask()
+        trial_num = trial.number
+        
+        arch = trial.suggest_categorical("architecture", selected_architectures)
+        opt_name = trial.suggest_categorical("optimizer", selected_optimizers)
+        b_size = int(trial.suggest_categorical("batch_size", selected_batch_sizes))
+        dropout_val = trial.suggest_float("dropout", 0.1, 0.5)
+        
+        classifier_lr = trial.suggest_float("classifier_lr", 1e-4, 1e-2, log=True)
+        if arch != "Simple CNN":
+            backbone_lr = trial.suggest_float("backbone_lr", 1e-6, 1e-4, log=True)
+        else:
+            backbone_lr = 0.0
+            
+        t_log = f"\n--- [Trial {trial_num+1}/{num_trials}] ---\n"
+        t_log += f"Parameters:\n"
+        t_log += f"  - Architecture: {arch}\n"
+        t_log += f"  - Optimizer: {opt_name}\n"
+        t_log += f"  - Batch Size: {b_size}\n"
+        t_log += f"  - Dropout: {dropout_val:.2f}\n"
+        t_log += f"  - Classifier LR: {classifier_lr:.2e}\n"
+        if arch != "Simple CNN":
+            t_log += f"  - Backbone LR: {backbone_lr:.2e}\n"
+        
+        log_text += t_log + "Training and validating model...\n"
+        yield log_text, gr.update(), None
+        
+        train_dataset = NIHDataset(train_df, transform=transform)
+        val_dataset = NIHDataset(val_df, transform=transform)
+        train_loader = DataLoader(train_dataset, batch_size=b_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=b_size, shuffle=False)
+        
+        model = get_model(arch)
+        
+        # Inject dropout
+        if arch == "ResNet-18":
+            model.fc = nn.Sequential(
+                nn.Dropout(dropout_val),
+                nn.Linear(model.fc[1].in_features, len(ALL_LABELS))
+            )
+        elif arch == "MobileNet-V2":
+            model.classifier[0] = nn.Dropout(dropout_val)
+        elif arch == "DenseNet-121":
+            model.classifier[0] = nn.Dropout(dropout_val)
+        elif arch == "Simple CNN":
+            model.classifier[0] = nn.Dropout(dropout_val)
+        elif arch == "Hybrid Model":
+            model.classifier[0] = nn.Dropout(dropout_val)
+            
+        model.to(device)
+        
+        for param in model.parameters():
+            param.requires_grad = True
+            
+        if arch == "Simple CNN":
+            params = model.parameters()
+            if opt_name == "Adam":
+                optimizer = torch.optim.Adam(params, lr=classifier_lr)
+            elif opt_name == "SGD":
+                optimizer = torch.optim.SGD(params, lr=classifier_lr, momentum=0.9)
+            else:
+                optimizer = torch.optim.RMSprop(params, lr=classifier_lr)
+        else:
+            backbone_params = []
+            classifier_params = []
+            classifier_layer_name = "fc" if arch == "ResNet-18" else "classifier"
+            for name, param in model.named_parameters():
+                if classifier_layer_name in name:
+                    classifier_params.append(param)
+                else:
+                    backbone_params.append(param)
+                    
+            if opt_name == "Adam":
+                optimizer = torch.optim.Adam([
+                    {"params": backbone_params, "lr": backbone_lr},
+                    {"params": classifier_params, "lr": classifier_lr}
+                ])
+            elif opt_name == "SGD":
+                optimizer = torch.optim.SGD([
+                    {"params": backbone_params, "lr": backbone_lr},
+                    {"params": classifier_params, "lr": classifier_lr}
+                ], momentum=0.9)
+            else:
+                optimizer = torch.optim.RMSprop([
+                    {"params": backbone_params, "lr": backbone_lr},
+                    {"params": classifier_params, "lr": classifier_lr}
+                ])
+                
+        best_val_f1 = 0.0
+        for epoch in progress.tqdm(range(int(epochs_per_trial)), desc=f"Trial {trial_num+1} Epochs"):
+            model.train()
+            for inputs, labels in train_loader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                
+            val_f1 = evaluate_model(model, val_loader, device)
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                
+        study.tell(trial, best_val_f1)
+        log_text += f"Trial {trial_num+1} Completed. Best Validation F1-Score: {best_val_f1 * 100:.2f}%\n"
+        yield log_text, gr.update(), None
+        
+    best_trial = study.best_trial
+    log_text += f"\n=====================================\n"
+    log_text += f"OPTIMIZATION COMPLETE!\n"
+    log_text += f"Best Trial Number: {best_trial.number + 1}\n"
+    log_text += f"Best Validation F1-Score: {best_trial.value * 100:.2f}%\n"
+    log_text += f"Best Parameters:\n"
+    for k, v in best_trial.params.items():
+        log_text += f"  - {k}: {v}\n"
+    log_text += f"=====================================\n"
+    
+    # Generate History Plot
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    trial_nums = [t.number + 1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    f1s = [t.value * 100 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    ax.plot(trial_nums, f1s, marker='o', color='purple', linewidth=2, label="Trial F1")
+    ax.set_title("Optuna Hyperparameter Optimization History")
+    ax.set_xlabel("Trial Number")
+    ax.set_ylabel("Validation F1-Score (%)")
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend()
+    plt.tight_layout()
+    
+    best_params_path = os.path.join(MODELS_DIR, "best_optuna_params.json")
+    with open(best_params_path, "w") as f:
+        json.dump({
+            "best_trial_number": best_trial.number + 1,
+            "best_value": best_trial.value,
+            "best_params": best_trial.params
+        }, f, indent=4)
+        
+    results_summary = f"Best Validation F1-Score: {best_trial.value * 100:.2f}%\n\nBest Hyperparameters:\n"
+    for k, v in best_trial.params.items():
+        if isinstance(v, float):
+            results_summary += f"{k}: {v:.2e}\n" if v < 1e-3 else f"{k}: {v:.4f}\n"
+        else:
+            results_summary += f"{k}: {v}\n"
+            
+    yield log_text, fig, results_summary
+
 def predict_image(image, model_name):
     if image is None:
         return "Please upload an image."
@@ -491,6 +751,31 @@ with gr.Blocks() as demo:
             prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
         predict_btn = gr.Button("Predict Disease", variant="primary")
         
+    with gr.Tab("4. Hyperparameter Tuning (Optuna)"):
+        gr.Markdown("### Optimize hyper-parameters using Optuna. The dataset is split 80% for training and 20% for validation evaluation.")
+        with gr.Row():
+            with gr.Column():
+                optuna_trials_input = gr.Slider(minimum=1, maximum=50, value=5, step=1, label="Number of Trials")
+                optuna_epochs_input = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Epochs per Trial")
+                optuna_archs_input = gr.CheckboxGroup(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value=["ResNet-18", "MobileNet-V2"], label="Base Architectures to Search")
+                optuna_opts_input = gr.CheckboxGroup(choices=["Adam", "SGD", "RMSprop"], value=["Adam", "SGD"], label="Optimizers to Search")
+                optuna_batch_input = gr.CheckboxGroup(choices=["8", "16", "32"], value=["16", "32"], label="Batch Sizes to Search")
+            with gr.Column():
+                optuna_balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
+                optuna_balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)")
+                optuna_diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases", info="Select specific diseases to train on a targeted subset.")
+                with gr.Row():
+                    optuna_select_all_btn = gr.Button("Select All")
+                    optuna_deselect_all_btn = gr.Button("Clear Selection")
+                    
+        optuna_tune_btn = gr.Button("Start Hyperparameter Optimization", variant="primary")
+        
+        with gr.Row():
+            optuna_log_output = gr.Textbox(label="Optimization Terminal Output", lines=10, max_lines=20)
+            with gr.Column():
+                optuna_plot_output = gr.Plot(label="Optimization History Graph")
+                optuna_params_output = gr.Textbox(label="Best Hyperparameters Found", lines=8)
+                
     def toggle_balanced_size(balanced):
         return gr.update(visible=balanced)
         
@@ -517,6 +802,29 @@ with gr.Blocks() as demo:
     infer_model_dropdown.change(fn=lambda x: x, inputs=[infer_model_dropdown], outputs=[model_dropdown])
     
     predict_btn.click(fn=predict_image, inputs=[image_input, infer_model_dropdown], outputs=[prediction_output])
+    
+    optuna_balanced_input.change(fn=toggle_balanced_size, inputs=[optuna_balanced_input], outputs=[optuna_balanced_size_input])
+    optuna_select_all_btn.click(fn=lambda: gr.update(value=ALL_LABELS), outputs=optuna_diseases_input)
+    optuna_deselect_all_btn.click(fn=lambda: gr.update(value=[]), outputs=optuna_diseases_input)
+    
+    optuna_tune_btn.click(
+        fn=optuna_tune_model,
+        inputs=[
+            optuna_trials_input,
+            optuna_epochs_input,
+            optuna_archs_input,
+            optuna_opts_input,
+            optuna_batch_input,
+            optuna_diseases_input,
+            optuna_balanced_input,
+            optuna_balanced_size_input
+        ],
+        outputs=[
+            optuna_log_output,
+            optuna_plot_output,
+            optuna_params_output
+        ]
+    )
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
