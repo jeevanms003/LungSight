@@ -162,6 +162,9 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         
     df = pd.read_csv(CSV_PATH)
     
+    # Filter dataset to only include images that actually exist on disk
+    df = df[df['Image Index'].isin(all_image_paths.keys())].reset_index(drop=True)
+    
     if selected_diseases:
         if balanced_sampling:
             sample_size = int(balanced_size)
