@@ -12,19 +12,6 @@ import json
 import matplotlib.pyplot as plt
 import io
 import time
-import numpy as np
-import cv2
-
-def apply_clahe(pil_img):
-    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to normalize X-ray contrast.
-    This is critical for generalization: X-rays from different machines/sources have wildly different
-    contrast and brightness. CLAHE normalizes them so the model sees consistent features."""
-    img_np = np.array(pil_img.convert('RGB'))
-    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-    result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    return Image.fromarray(result)
 
 try:
     import optuna
@@ -48,18 +35,6 @@ for i in range(1, 13):
     for p in imgs:
         all_image_paths[os.path.basename(p)] = p
 print(f"Loaded {len(all_image_paths)} image paths.")
-
-# Load BBox annotations list at startup for sample selection in the UI
-bbox_list_csv = os.path.join(DATA_DIR, "BBox_List_2017.csv")
-bbox_choices = [""]
-if os.path.exists(bbox_list_csv):
-    try:
-        bbox_df = pd.read_csv(bbox_list_csv)
-        unique_bbox_imgs = set(bbox_df['Image Index'].unique())
-        bbox_choices += sorted(list(unique_bbox_imgs.intersection(all_image_paths.keys())))
-    except Exception as e:
-        print("Error reading BBox list at startup:", e)
-
 
 def load_compat_state_dict(model, state_dict):
     """
@@ -204,7 +179,6 @@ class NIHDataset(Dataset):
         else:
             try:
                 img = Image.open(img_path).convert('RGB')
-                img = apply_clahe(img)
             except:
                 img = Image.new('RGB', (224, 224))
             
@@ -239,10 +213,9 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             dfs = []
             for d in selected_diseases:
                 d_df = df[df['Finding Labels'].str.contains(d)].copy()
-                if len(d_df) > 0:
-                    sample_n = min(len(d_df), sample_size)
-                    # Random sampling instead of head() to prevent patient cohort selection bias
-                    dfs.append(d_df.sample(n=sample_n, random_state=42))
+                sample_n = min(len(d_df), sample_size)
+                if sample_n > 0:
+                    dfs.append(d_df.sort_values(['Patient ID', 'Follow-up #']).head(sample_n))
             if dfs:
                 df = pd.concat(dfs).drop_duplicates().reset_index(drop=True)
             else:
@@ -259,51 +232,19 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         yield log_text, gr.update()
         df = df.reset_index(drop=True)
         
-    # Patient-wise Train/Validation Split (80% / 20%) to prevent data leakage and enable checkpoint selection
-    import numpy as np
-    unique_patients = df['Patient ID'].unique()
-    state = np.random.RandomState(42)
-    state.shuffle(unique_patients)
-    
-    if len(unique_patients) >= 5:
-        split_idx = int(len(unique_patients) * 0.8)
-        train_patients = set(unique_patients[:split_idx])
-        val_patients = set(unique_patients[split_idx:])
-        
-        train_df = df[df['Patient ID'].isin(train_patients)].reset_index(drop=True)
-        val_df = df[df['Patient ID'].isin(val_patients)].reset_index(drop=True)
-    else:
-        train_df = df
-        val_df = df
-        
-    msg = f"Dataset split: {len(train_df)} training samples, {len(val_df)} validation samples (on unique patient boundaries)."
+    msg = f"Training on {len(df)} images for {epochs} epochs with batch size {batch_size}."
     print(msg)
     log_text += msg + "\n"
     yield log_text, gr.update()
     
-    train_transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.RandomCrop(224),
-        transforms.RandomRotation(degrees=15),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    val_transform = transforms.Compose([
+    transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    train_dataset = NIHDataset(train_df, transform=train_transform)
-    val_dataset = NIHDataset(val_df, transform=val_transform)
-    
-    train_loader = DataLoader(train_dataset, batch_size=int(batch_size), shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=int(batch_size), shuffle=False)
+    dataset = NIHDataset(df, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=int(batch_size), shuffle=True)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log_text += f"Using device: {device}\n"
@@ -350,12 +291,9 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             {"params": classifier_params, "lr": 1e-3}
         ])
         
-    # Learning Rate Scheduler to improve convergence on plateaus
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
-    
-    # Calculate positive weights for highly imbalanced datasets based only on training set to prevent data leakage
+    # Calculate positive weights for highly imbalanced datasets to boost F1-Score (capped at 10.0 for stability)
     pos_counts = torch.zeros(len(ALL_LABELS))
-    for labels_str in train_df['Finding Labels']:
+    for labels_str in df['Finding Labels']:
         labels = labels_str.split('|')
         for i, l in enumerate(ALL_LABELS):
             if l in labels:
@@ -364,25 +302,23 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     pos_weight = torch.ones(len(ALL_LABELS))
     for i in range(len(ALL_LABELS)):
         if pos_counts[i] > 0:
-            pos_weight[i] = min((len(train_df) - pos_counts[i]) / pos_counts[i], 10.0)
+            pos_weight[i] = min((len(df) - pos_counts[i]) / pos_counts[i], 10.0)
             
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     
-    history = {"loss": [], "accuracy": [], "val_accuracy": [], "architecture": architecture}
-    
-    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
-    metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
-    
-    best_val_f1 = 0.0
+    history = {"loss": [], "accuracy": [], "architecture": architecture}
     
     for epoch in progress.tqdm(range(int(epochs)), desc="Epochs"):
+        # Put entire model in train mode to allow both backbone fine-tuning and dropout regularization
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
-        tp, fp, fn = 0, 0, 0
+        tp = 0
+        fp = 0
+        fn = 0
         
-        for inputs, labels in progress.tqdm(train_loader, desc="Batches"):
+        for inputs, labels in progress.tqdm(dataloader, desc="Batches"):
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
@@ -394,48 +330,40 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             running_loss += loss.item() * inputs.size(0)
             
             preds = (torch.sigmoid(outputs) > 0.5).float()
+            # Calculate standard average binary accuracy per label (proper multi-label metric)
             correct += (preds == labels).float().sum().item()
             total += inputs.size(0) * len(ALL_LABELS)
             
+            # Accumulate TP, FP, FN (Micro F1 metrics) for positive class disease detection
             tp += ((preds == 1) & (labels == 1)).float().sum().item()
             fp += ((preds == 1) & (labels == 0)).float().sum().item()
             fn += ((preds == 0) & (labels == 1)).float().sum().item()
             
         epoch_loss = running_loss / (total / len(ALL_LABELS))
+        
+        # Calculate Micro F1-Score (uninflated disease detection metric)
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
         epoch_f1 = 2 * precision * recall / (precision + recall + 1e-8)
         
-        # Evaluate on Validation set (using evaluate_model function)
-        val_f1 = evaluate_model(model, val_loader, device)
-        
-        # Step the scheduler using validation F1
-        scheduler.step(val_f1)
-        
         history["loss"].append(epoch_loss)
-        history["accuracy"].append(epoch_f1)      # Training F1-Score
-        history["val_accuracy"].append(val_f1)   # Validation F1-Score
+        history["accuracy"].append(epoch_f1)  # Use F1-Score as the primary Accuracy!
         
         msg = f"Epoch [{epoch+1}/{epochs}] -\n"
-        msg += f"  -> Train Loss: {epoch_loss:.4f}\n"
-        msg += f"  -> Train F1-Score: {epoch_f1 * 100:.2f}%\n"
-        msg += f"  -> Val F1-Score: {val_f1 * 100:.2f}%\n"
-        
-        # Save model if validation F1 improves (Checkpoint Selection)
-        if val_f1 > best_val_f1 or epoch == 0:
-            best_val_f1 = val_f1
-            torch.save(model.state_dict(), model_path)
-            msg += f"  [!] New best validation checkpoint saved! (Val F1: {best_val_f1*100:.2f}%)\n"
-            
+        msg += f"  -> Current Training Loss: {epoch_loss:.4f}\n"
+        msg += f"  -> Current Training Accuracy (F1-Score): {epoch_f1 * 100:.2f}%\n"
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update()
         
-    # Save validation metrics
+    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
+    metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
+    
+    torch.save(model.state_dict(), model_path)
     with open(metrics_path, "w") as f:
         json.dump(history, f)
         
-    log_text += f"Training complete! Best model saved as {model_name}.pth (Best Val F1: {best_val_f1*100:.2f}%)\n"
+    log_text += f"Training complete! Model saved as {model_name}.pth\n"
     yield log_text, update_model_dropdown()
 
 def update_model_dropdown():
@@ -468,19 +396,14 @@ def get_performance(model_name):
         ax2.plot(epochs, [f * 100 for f in history["f1_score"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
         ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='x', linestyle='--', color='gray', alpha=0.6, label="Binary Accuracy (Old)")
         final_acc = history["f1_score"][-1]
-        ax2.set_title("Training Accuracy (F1-Score)")
     else:
         # New scheme: history["accuracy"] is F1-score itself!
-        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='green', linewidth=2, label="Train F1-Score")
-        if "val_accuracy" in history:
-            ax2.plot(epochs, [v * 100 for v in history["val_accuracy"]], marker='s', linestyle='--', color='orange', linewidth=2, label="Val F1-Score")
-            final_acc = max(history["val_accuracy"])
-        else:
-            final_acc = history["accuracy"][-1]
-        ax2.set_title("Training & Validation F1-Score")
+        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
+        final_acc = history["accuracy"][-1]
         
+    ax2.set_title("Training Accuracy (F1-Score)")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("F1-Score (%)")
+    ax2.set_ylabel("Accuracy (%)")
     ax2.legend(loc="lower right")
     ax2.grid(True, linestyle='--', alpha=0.5)
     
@@ -488,7 +411,7 @@ def get_performance(model_name):
     
     final_loss = history["loss"][-1]
     arch = history.get("architecture", "Unknown")
-    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Best Val F1-Score: {final_acc*100:.2f}%"
+    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Accuracy (F1-Score): {final_acc*100:.2f}%"
     
     return fig, stats
 
@@ -564,32 +487,15 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
         yield log_text + f"Error: Dataset size too small ({len(df)} images). Please select more diseases or increase sampling size.\n", gr.update(), None
         return
         
-    # Patient-wise Train/Validation Split (80% / 20%) to avoid data leakage
-    import numpy as np
-    unique_patients = df['Patient ID'].unique()
-    state = np.random.RandomState(42)
-    state.shuffle(unique_patients)
-    
-    split_idx = int(len(unique_patients) * 0.8)
-    train_patients = set(unique_patients[:split_idx])
-    val_patients = set(unique_patients[split_idx:])
-    
-    train_df = df[df['Patient ID'].isin(train_patients)].reset_index(drop=True)
-    val_df = df[df['Patient ID'].isin(val_patients)].reset_index(drop=True)
+    # Train/Validation Split (80% / 20%)
+    train_df = df.sample(frac=0.8, random_state=42)
+    val_df = df.drop(train_df.index).reset_index(drop=True)
+    train_df = train_df.reset_index(drop=True)
     
     log_text += f"Split details: {len(train_df)} training samples, {len(val_df)} validation samples.\n"
     yield log_text, gr.update(), None
     
-    train_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomRotation(degrees=10),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    val_transform = transforms.Compose([
+    transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -645,8 +551,8 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
         log_text += t_log + "Training and validating model...\n"
         yield log_text, gr.update(), None
         
-        train_dataset = NIHDataset(train_df, transform=train_transform)
-        val_dataset = NIHDataset(val_df, transform=val_transform)
+        train_dataset = NIHDataset(train_df, transform=transform)
+        val_dataset = NIHDataset(val_df, transform=transform)
         train_loader = DataLoader(train_dataset, batch_size=b_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=b_size, shuffle=False)
         
@@ -785,86 +691,16 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
             
     yield log_text, fig, results_summary
 
-def generate_gradcam(model, img_tensor, target_class_idx, architecture):
-    model.eval()
-    
-    target_layer = None
-    if architecture == "ResNet-18":
-        target_layer = model.layer4[-1]
-    elif architecture == "MobileNet-V2":
-        target_layer = model.features[-1]
-    elif architecture == "DenseNet-121":
-        target_layer = model.features.norm5
-    elif architecture == "Simple CNN":
-        target_layer = model.features[12]
-    elif architecture == "Hybrid Model":
-        target_layer = model.densenet_features.norm5
-        
-    if target_layer is None:
-        return None
-        
-    features = []
-    gradients = []
-    
-    # Register forward hook to capture features and output tensor's backward hook
-    def forward_hook(module, input, output):
-        features.append(output)
-        def backward_hook(grad):
-            gradients.append(grad.detach())
-        output.register_hook(backward_hook)
-        
-    h_f = target_layer.register_forward_hook(forward_hook)
-    
-    try:
-        with torch.enable_grad():
-            output = model(img_tensor)
-            score = output[0, target_class_idx]
-            model.zero_grad()
-            score.backward()
-        
-        if not features or not gradients:
-            return None
-            
-        acts = features[0].detach()
-        grads = gradients[0]
-        
-        weights = torch.mean(grads, dim=(2, 3), keepdim=True)
-        cam = torch.sum(weights * acts, dim=1).squeeze()
-        cam = torch.clamp(cam, min=0)
-        
-        if cam.max() > 0:
-            cam = cam / cam.max()
-            
-        return cam.cpu().numpy()
-    except Exception as e:
-        print("Error generating Grad-CAM:", e)
-        return None
-    finally:
-        h_f.remove()
-
-def overlay_heatmap(img_pil, cam_mask):
-    img_np = np.array(img_pil.convert('RGB'))
-    h, w, _ = img_np.shape
-    
-    heatmap = cv2.resize(cam_mask, (w, h))
-    heatmap = np.uint8(255 * heatmap)
-    
-    color_heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
-    color_heatmap = cv2.cvtColor(color_heatmap, cv2.COLOR_BGR2RGB)
-    
-    overlaid = cv2.addWeighted(img_np, 0.6, color_heatmap, 0.4, 0)
-    return Image.fromarray(overlaid)
-
-def predict_image(image, model_name, threshold, bbox_filename):
+def predict_image(image, model_name):
     if image is None:
-        return {}, "### Please upload an image.", None, gr.update(visible=False)
+        return "Please upload an image."
     if not model_name:
-        return {}, "### Please select a trained model from Inference section.", None, gr.update(visible=False)
+        return "Please select a trained model from Performance section."
         
     model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
     metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
     if not os.path.exists(model_path):
-        return {}, "### Model file not found.", None, gr.update(visible=False)
+        return "Model file not found."
     
     arch = "ResNet-18"
     if os.path.exists(metrics_path):
@@ -879,143 +715,24 @@ def predict_image(image, model_name, threshold, bbox_filename):
     model = get_model(arch)
     load_compat_state_dict(model, torch.load(model_path, map_location=device))
     model.to(device)
-    
-    # Ensure gradients are enabled for the target layer backward pass in Grad-CAM
-    for param in model.parameters():
-        param.requires_grad = True
     model.eval()
     
-    base_transform = transforms.Compose([
+    transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    
-    # TTA augmentation transforms for robust inference on unknown images
-    tta_transforms = [
-        base_transform,
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.RandomHorizontalFlip(p=1.0),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.RandomRotation(degrees=5),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ColorJitter(brightness=0.1, contrast=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-    ]
-    
     image = image.convert('RGB')
-    # Apply CLAHE to normalize contrast from unknown X-ray sources
-    image = apply_clahe(image)
+    img_t = transform(image).unsqueeze(0).to(device)
     
-    # Test-Time Augmentation: average predictions across multiple augmented views
-    all_probs = []
-    for tta_tf in tta_transforms:
-        img_t = tta_tf(image).unsqueeze(0).to(device)
-        with torch.no_grad():
-            out = model(img_t)
-        p = torch.sigmoid(out).squeeze().cpu().numpy()
-        if p.ndim == 0:
-            p = np.array([p.item()])
-        all_probs.append(p)
-    probs = np.mean(all_probs, axis=0)
-    
-    # Re-run the base transform WITH gradients for Grad-CAM
-    img_t = base_transform(image).unsqueeze(0).to(device)
-    img_t.requires_grad = True
+    with torch.no_grad():
+        outputs = model(img_t)
+        probs = torch.sigmoid(outputs).squeeze().cpu().numpy()
+        if probs.ndim == 0:
+            probs = [probs.item()]
         
     results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
-    
-    # Generate detected pathologies markdown
-    detected_diseases = []
-    for label, prob in zip(ALL_LABELS, probs):
-        if label != "No Finding" and prob >= threshold:
-            detected_diseases.append((label, prob))
-            
-    detected_diseases = sorted(detected_diseases, key=lambda x: x[1], reverse=True)
-    
-    if detected_diseases:
-        detected_text = "### 🩺 Detected Pathologies (Confidence ≥ {:.0f}%):\n".format(threshold * 100)
-        for label, prob in detected_diseases:
-            detected_text += "- **{}**: {:.1f}%\n".format(label, prob * 100)
-    else:
-        no_finding_prob = probs[ALL_LABELS.index("No Finding")]
-        detected_text = "### 🩺 Detected Pathologies (Confidence ≥ {:.0f}%):\n- **No findings detected** (Confidence of No Finding: {:.1f}%)\n".format(threshold * 100, no_finding_prob * 100)
-        
-    # Target top diagnosis index for Grad-CAM
-    top_class_idx = int(np.argmax(probs))
-    no_finding_idx = ALL_LABELS.index("No Finding")
-    if top_class_idx == no_finding_idx:
-        other_probs = [(i, p) for i, p in enumerate(probs) if i != no_finding_idx]
-        best_other_idx, best_other_p = max(other_probs, key=lambda x: x[1])
-        if best_other_p > 0.10:
-            top_class_idx = best_other_idx
-            
-    cam_mask = generate_gradcam(model, img_t, top_class_idx, arch)
-    if cam_mask is not None:
-        gradcam_img = overlay_heatmap(image, cam_mask)
-    else:
-        gradcam_img = image
-        
-    # BBox overlay logic
-    bbox_visible_update = gr.update(visible=False)
-    
-    if bbox_filename:
-        sample_path = all_image_paths.get(bbox_filename)
-        if sample_path and os.path.exists(sample_path):
-            try:
-                sample_img = Image.open(sample_path).convert('RGB')
-                # Verify that the currently uploaded image matches the selected sample image
-                if image.size == sample_img.size and np.array_equal(np.array(image), np.array(sample_img)):
-                    bbox_csv_path = os.path.join(DATA_DIR, "BBox_List_2017.csv")
-                    if os.path.exists(bbox_csv_path):
-                        bbox_df = pd.read_csv(bbox_csv_path)
-                        matches = bbox_df[bbox_df['Image Index'] == bbox_filename]
-                        if len(matches) > 0:
-                            draw_img = image.copy()
-                            import PIL.ImageDraw as ImageDraw
-                            draw = ImageDraw.Draw(draw_img)
-                            orig_w, orig_h = draw_img.size
-                            
-                            for _, row in matches.iterrows():
-                                x_1024 = float(row['Bbox [x'])
-                                y_1024 = float(row['y'])
-                                w_1024 = float(row['w'])
-                                h_1024 = float(row['h'])
-                                label = str(row['Finding Label'])
-                                
-                                x = x_1024 * (orig_w / 1024.0)
-                                y = y_1024 * (orig_h / 1024.0)
-                                w = w_1024 * (orig_w / 1024.0)
-                                h = h_1024 * (orig_h / 1024.0)
-                                
-                                draw.rectangle([x, y, x + w, y + h], outline="red", width=4)
-                                text = f"{label} (Radiologist Annotation)"
-                                draw.rectangle([x, max(0, y - 20), x + len(text)*8, max(20, y)], fill="red")
-                                draw.text((x + 4, max(1, y - 18)), text, fill="white")
-                                
-                            bbox_visible_update = gr.update(visible=True, value=draw_img)
-            except Exception as e:
-                print("Error drawing bounding box:", e)
-                print("Error drawing bounding box:", e)
-                
-    return results, detected_text, gradcam_img, bbox_visible_update
+    return results
 
 with gr.Blocks() as demo:
     gr.Markdown("# NIH Chest X-ray Model Trainer & Predictor")
@@ -1030,7 +747,7 @@ with gr.Blocks() as demo:
             batch_size_input = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="Batch Size")
         with gr.Row():
             balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
-            balanced_size_input = gr.Dropdown(choices=["100", "200", "500", "1000", "2000", "5000"], value="500", label="Balanced Sample Size (images per selected disease)", visible=True)
+            balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
         with gr.Row():
             with gr.Column():
                 diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
@@ -1051,28 +768,8 @@ with gr.Blocks() as demo:
     with gr.Tab("3. Inference"):
         infer_model_dropdown = gr.Dropdown(choices=[], label="Select Model for Inference")
         with gr.Row():
-            with gr.Column():
-                image_input = gr.Image(type="pil", label="Upload X-ray Image")
-                # Dropdown for selecting sample images with Ground-Truth annotations
-                bbox_sample_dropdown = gr.Dropdown(
-                    choices=bbox_choices if 'bbox_choices' in globals() else [""], 
-                    label="Or Select a Sample with Ground-Truth Annotations",
-                    value=""
-                )
-                threshold_slider = gr.Slider(
-                    minimum=0.05, 
-                    maximum=0.95, 
-                    value=0.50, 
-                    step=0.05, 
-                    label="Decision Threshold (Disease Detection Sensitivity)",
-                    info="Lower values increase sensitivity (more findings), higher values increase specificity (fewer false positives)."
-                )
-            with gr.Column():
-                prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
-                detected_output = gr.Markdown("### Detected Pathologies\n*Run prediction to analyze.*")
-                with gr.Row():
-                    gradcam_output = gr.Image(type="pil", label="Grad-CAM Focus Heatmap")
-                    bbox_output = gr.Image(type="pil", label="Ground-Truth Bounding Box", visible=False)
+            image_input = gr.Image(type="pil", label="Upload X-ray Image")
+            prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
         predict_btn = gr.Button("Predict Disease", variant="primary")
         
     with gr.Tab("4. Hyperparameter Tuning (Optuna)"):
@@ -1122,24 +819,10 @@ with gr.Blocks() as demo:
     
     demo.load(fn=on_refresh, inputs=None, outputs=[model_dropdown, infer_model_dropdown])
     
-    def on_bbox_sample_change(filename):
-        if not filename:
-            return None
-        img_path = all_image_paths.get(filename)
-        if img_path and os.path.exists(img_path):
-            return Image.open(img_path)
-        return None
-        
-    bbox_sample_dropdown.change(fn=on_bbox_sample_change, inputs=[bbox_sample_dropdown], outputs=[image_input])
-
     model_dropdown.change(fn=get_performance, inputs=[model_dropdown], outputs=[perf_plot, perf_stats])
     infer_model_dropdown.change(fn=lambda x: x, inputs=[infer_model_dropdown], outputs=[model_dropdown])
     
-    predict_btn.click(
-        fn=predict_image, 
-        inputs=[image_input, infer_model_dropdown, threshold_slider, bbox_sample_dropdown], 
-        outputs=[prediction_output, detected_output, gradcam_output, bbox_output]
-    )
+    predict_btn.click(fn=predict_image, inputs=[image_input, infer_model_dropdown], outputs=[prediction_output])
     
     optuna_balanced_input.change(fn=toggle_balanced_size, inputs=[optuna_balanced_input], outputs=[optuna_balanced_size_input])
     optuna_select_all_btn.click(fn=lambda: gr.update(value=ALL_LABELS), outputs=optuna_diseases_input)
