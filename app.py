@@ -237,13 +237,16 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     log_text += msg + "\n"
     yield log_text, gr.update()
     
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
         transforms.Resize((224, 224)),
+        transforms.RandomRotation(degrees=10),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    dataset = NIHDataset(df, transform=transform)
+    dataset = NIHDataset(df, transform=train_transform)
     dataloader = DataLoader(dataset, batch_size=int(batch_size), shuffle=True)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -487,15 +490,32 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
         yield log_text + f"Error: Dataset size too small ({len(df)} images). Please select more diseases or increase sampling size.\n", gr.update(), None
         return
         
-    # Train/Validation Split (80% / 20%)
-    train_df = df.sample(frac=0.8, random_state=42)
-    val_df = df.drop(train_df.index).reset_index(drop=True)
-    train_df = train_df.reset_index(drop=True)
+    # Patient-wise Train/Validation Split (80% / 20%) to avoid data leakage
+    import numpy as np
+    unique_patients = df['Patient ID'].unique()
+    state = np.random.RandomState(42)
+    state.shuffle(unique_patients)
+    
+    split_idx = int(len(unique_patients) * 0.8)
+    train_patients = set(unique_patients[:split_idx])
+    val_patients = set(unique_patients[split_idx:])
+    
+    train_df = df[df['Patient ID'].isin(train_patients)].reset_index(drop=True)
+    val_df = df[df['Patient ID'].isin(val_patients)].reset_index(drop=True)
     
     log_text += f"Split details: {len(train_df)} training samples, {len(val_df)} validation samples.\n"
     yield log_text, gr.update(), None
     
-    transform = transforms.Compose([
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomRotation(degrees=10),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    val_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -551,8 +571,8 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
         log_text += t_log + "Training and validating model...\n"
         yield log_text, gr.update(), None
         
-        train_dataset = NIHDataset(train_df, transform=transform)
-        val_dataset = NIHDataset(val_df, transform=transform)
+        train_dataset = NIHDataset(train_df, transform=train_transform)
+        val_dataset = NIHDataset(val_df, transform=val_transform)
         train_loader = DataLoader(train_dataset, batch_size=b_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=b_size, shuffle=False)
         
