@@ -306,9 +306,25 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     
+    # Check for existing checkpoint to resume training
+    checkpoint_path = os.path.join(MODELS_DIR, f"{model_name}_checkpoint.pth")
+    start_epoch = 0
     history = {"loss": [], "accuracy": [], "architecture": architecture}
     
-    for epoch in progress.tqdm(range(int(epochs)), desc="Epochs"):
+    if os.path.exists(checkpoint_path):
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            history = checkpoint['history']
+            log_text += f"Found existing checkpoint for '{model_name}'. Resuming training from epoch {start_epoch + 1}...\n"
+            yield log_text, gr.update()
+        except Exception as e:
+            log_text += f"Failed to load checkpoint ({e}). Starting training from scratch.\n"
+            yield log_text, gr.update()
+            
+    for epoch in progress.tqdm(range(start_epoch, int(epochs)), desc="Epochs"):
         # Put entire model in train mode to allow both backbone fine-tuning and dropout regularization
         model.train()
         running_loss = 0.0
@@ -356,6 +372,17 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         log_text += msg + "\n"
         yield log_text, gr.update()
         
+        # Save epoch checkpoint in case environment disconnects
+        try:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'history': history,
+            }, checkpoint_path)
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
+        
     model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
     metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
     
@@ -363,6 +390,13 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     with open(metrics_path, "w") as f:
         json.dump(history, f)
         
+    # Clean up checkpoint on successful completion
+    if os.path.exists(checkpoint_path):
+        try:
+            os.remove(checkpoint_path)
+        except Exception as e:
+            print(f"Error removing checkpoint: {e}")
+            
     log_text += f"Training complete! Model saved as {model_name}.pth\n"
     yield log_text, update_model_dropdown()
 
