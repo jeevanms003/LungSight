@@ -12,6 +12,8 @@ import json
 import matplotlib.pyplot as plt
 import io
 import time
+import numpy as np
+import cv2
 
 try:
     import optuna
@@ -711,16 +713,86 @@ def optuna_tune_model(num_trials, epochs_per_trial, selected_architectures, sele
             
     yield log_text, fig, results_summary
 
+def generate_gradcam(model, img_tensor, target_class_idx, architecture):
+    model.eval()
+    
+    target_layer = None
+    if architecture == "ResNet-18":
+        target_layer = model.layer4[-1]
+    elif architecture == "MobileNet-V2":
+        target_layer = model.features[-1]
+    elif architecture == "DenseNet-121":
+        target_layer = model.features.norm5
+    elif architecture == "Simple CNN":
+        target_layer = model.features[12]
+    elif architecture == "Hybrid Model":
+        target_layer = model.densenet_features.norm5
+        
+    if target_layer is None:
+        return None
+        
+    features = []
+    gradients = []
+    
+    def forward_hook(module, input, output):
+        features.append(output.detach())
+        
+    def backward_hook(module, grad_input, grad_output):
+        gradients.append(grad_output[0].detach())
+        
+    h_f = target_layer.register_forward_hook(forward_hook)
+    h_b = target_layer.register_full_backward_hook(backward_hook)
+    
+    try:
+        output = model(img_tensor)
+        score = output[0, target_class_idx]
+        model.zero_grad()
+        score.backward()
+        
+        if not features or not gradients:
+            return None
+            
+        acts = features[0]
+        grads = gradients[0]
+        
+        weights = torch.mean(grads, dim=(2, 3), keepdim=True)
+        cam = torch.sum(weights * acts, dim=1).squeeze()
+        cam = torch.clamp(cam, min=0)
+        
+        if cam.max() > 0:
+            cam = cam / cam.max()
+            
+        return cam.cpu().numpy()
+    except Exception as e:
+        print("Error generating Grad-CAM:", e)
+        return None
+    finally:
+        h_f.remove()
+        h_b.remove()
+
+def overlay_heatmap(img_pil, cam_mask):
+    img_np = np.array(img_pil.convert('RGB'))
+    h, w, _ = img_np.shape
+    
+    heatmap = cv2.resize(cam_mask, (w, h))
+    heatmap = np.uint8(255 * heatmap)
+    
+    color_heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    color_heatmap = cv2.cvtColor(color_heatmap, cv2.COLOR_BGR2RGB)
+    
+    overlaid = cv2.addWeighted(img_np, 0.6, color_heatmap, 0.4, 0)
+    return Image.fromarray(overlaid)
+
 def predict_image(image, model_name):
     if image is None:
-        return "Please upload an image."
+        return "Please upload an image.", None
     if not model_name:
-        return "Please select a trained model from Performance section."
+        return "Please select a trained model from Performance section.", None
         
     model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
     metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
     if not os.path.exists(model_path):
-        return "Model file not found."
+        return "Model file not found.", None
     
     arch = "ResNet-18"
     if os.path.exists(metrics_path):
@@ -735,6 +807,10 @@ def predict_image(image, model_name):
     model = get_model(arch)
     load_compat_state_dict(model, torch.load(model_path, map_location=device))
     model.to(device)
+    
+    # Ensure gradients are enabled for the target layer backward pass in Grad-CAM
+    for param in model.parameters():
+        param.requires_grad = True
     model.eval()
     
     transform = transforms.Compose([
@@ -744,15 +820,32 @@ def predict_image(image, model_name):
     ])
     image = image.convert('RGB')
     img_t = transform(image).unsqueeze(0).to(device)
+    img_t.requires_grad = True
     
-    with torch.no_grad():
-        outputs = model(img_t)
-        probs = torch.sigmoid(outputs).squeeze().cpu().numpy()
-        if probs.ndim == 0:
-            probs = [probs.item()]
+    outputs = model(img_t)
+    probs = torch.sigmoid(outputs).squeeze().detach().cpu().numpy()
+    if probs.ndim == 0:
+        probs = [probs.item()]
         
     results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
-    return results
+    
+    # Target top diagnosis index for Grad-CAM
+    # Ignore "No Finding" index if there is a disease with probability > 10%
+    top_class_idx = int(np.argmax(probs))
+    no_finding_idx = ALL_LABELS.index("No Finding")
+    if top_class_idx == no_finding_idx:
+        other_probs = [(i, p) for i, p in enumerate(probs) if i != no_finding_idx]
+        best_other_idx, best_other_p = max(other_probs, key=lambda x: x[1])
+        if best_other_p > 0.10:
+            top_class_idx = best_other_idx
+            
+    cam_mask = generate_gradcam(model, img_t, top_class_idx, arch)
+    if cam_mask is not None:
+        gradcam_img = overlay_heatmap(image, cam_mask)
+    else:
+        gradcam_img = image
+        
+    return results, gradcam_img
 
 with gr.Blocks() as demo:
     gr.Markdown("# NIH Chest X-ray Model Trainer & Predictor")
@@ -789,7 +882,9 @@ with gr.Blocks() as demo:
         infer_model_dropdown = gr.Dropdown(choices=[], label="Select Model for Inference")
         with gr.Row():
             image_input = gr.Image(type="pil", label="Upload X-ray Image")
-            prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
+            with gr.Column():
+                prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
+                gradcam_output = gr.Image(type="pil", label="Grad-CAM Visualization (Targeting Top Diagnosis)")
         predict_btn = gr.Button("Predict Disease", variant="primary")
         
     with gr.Tab("4. Hyperparameter Tuning (Optuna)"):
@@ -842,7 +937,7 @@ with gr.Blocks() as demo:
     model_dropdown.change(fn=get_performance, inputs=[model_dropdown], outputs=[perf_plot, perf_stats])
     infer_model_dropdown.change(fn=lambda x: x, inputs=[infer_model_dropdown], outputs=[model_dropdown])
     
-    predict_btn.click(fn=predict_image, inputs=[image_input, infer_model_dropdown], outputs=[prediction_output])
+    predict_btn.click(fn=predict_image, inputs=[image_input, infer_model_dropdown], outputs=[prediction_output, gradcam_output])
     
     optuna_balanced_input.change(fn=toggle_balanced_size, inputs=[optuna_balanced_input], outputs=[optuna_balanced_size_input])
     optuna_select_all_btn.click(fn=lambda: gr.update(value=ALL_LABELS), outputs=optuna_diseases_input)
