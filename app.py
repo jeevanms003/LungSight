@@ -38,6 +38,18 @@ for i in range(1, 13):
         all_image_paths[os.path.basename(p)] = p
 print(f"Loaded {len(all_image_paths)} image paths.")
 
+# Load BBox annotations list at startup for sample selection in the UI
+bbox_list_csv = os.path.join(DATA_DIR, "BBox_List_2017.csv")
+bbox_choices = [""]
+if os.path.exists(bbox_list_csv):
+    try:
+        bbox_df = pd.read_csv(bbox_list_csv)
+        unique_bbox_imgs = set(bbox_df['Image Index'].unique())
+        bbox_choices += sorted(list(unique_bbox_imgs.intersection(all_image_paths.keys())))
+    except Exception as e:
+        print("Error reading BBox list at startup:", e)
+
+
 def load_compat_state_dict(model, state_dict):
     """
     Loads state_dict into model, dynamically adapting between older format (nn.Linear)
@@ -734,14 +746,14 @@ def generate_gradcam(model, img_tensor, target_class_idx, architecture):
     features = []
     gradients = []
     
+    # Register forward hook to capture features and output tensor's backward hook
     def forward_hook(module, input, output):
-        features.append(output.detach())
-        
-    def backward_hook(module, grad_input, grad_output):
-        gradients.append(grad_output[0].detach())
+        features.append(output)
+        def backward_hook(grad):
+            gradients.append(grad.detach())
+        output.register_hook(backward_hook)
         
     h_f = target_layer.register_forward_hook(forward_hook)
-    h_b = target_layer.register_full_backward_hook(backward_hook)
     
     try:
         with torch.enable_grad():
@@ -753,7 +765,7 @@ def generate_gradcam(model, img_tensor, target_class_idx, architecture):
         if not features or not gradients:
             return None
             
-        acts = features[0]
+        acts = features[0].detach()
         grads = gradients[0]
         
         weights = torch.mean(grads, dim=(2, 3), keepdim=True)
@@ -769,7 +781,6 @@ def generate_gradcam(model, img_tensor, target_class_idx, architecture):
         return None
     finally:
         h_f.remove()
-        h_b.remove()
 
 def overlay_heatmap(img_pil, cam_mask):
     img_np = np.array(img_pil.convert('RGB'))
@@ -784,16 +795,16 @@ def overlay_heatmap(img_pil, cam_mask):
     overlaid = cv2.addWeighted(img_np, 0.6, color_heatmap, 0.4, 0)
     return Image.fromarray(overlaid)
 
-def predict_image(image, model_name):
+def predict_image(image, model_name, threshold, bbox_filename):
     if image is None:
-        return "Please upload an image.", None
+        return {}, "### Please upload an image.", None, gr.update(visible=False)
     if not model_name:
-        return "Please select a trained model from Performance section.", None
+        return {}, "### Please select a trained model from Inference section.", None, gr.update(visible=False)
         
     model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
     metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
     if not os.path.exists(model_path):
-        return "Model file not found.", None
+        return {}, "### Model file not found.", None, gr.update(visible=False)
     
     arch = "ResNet-18"
     if os.path.exists(metrics_path):
@@ -830,8 +841,23 @@ def predict_image(image, model_name):
         
     results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
     
+    # Generate detected pathologies markdown
+    detected_diseases = []
+    for label, prob in zip(ALL_LABELS, probs):
+        if label != "No Finding" and prob >= threshold:
+            detected_diseases.append((label, prob))
+            
+    detected_diseases = sorted(detected_diseases, key=lambda x: x[1], reverse=True)
+    
+    if detected_diseases:
+        detected_text = "### 🩺 Detected Pathologies (Confidence ≥ {:.0f}%):\n".format(threshold * 100)
+        for label, prob in detected_diseases:
+            detected_text += "- **{}**: {:.1f}%\n".format(label, prob * 100)
+    else:
+        no_finding_prob = probs[ALL_LABELS.index("No Finding")]
+        detected_text = "### 🩺 Detected Pathologies (Confidence ≥ {:.0f}%):\n- **No findings detected** (Confidence of No Finding: {:.1f}%)\n".format(threshold * 100, no_finding_prob * 100)
+        
     # Target top diagnosis index for Grad-CAM
-    # Ignore "No Finding" index if there is a disease with probability > 10%
     top_class_idx = int(np.argmax(probs))
     no_finding_idx = ALL_LABELS.index("No Finding")
     if top_class_idx == no_finding_idx:
@@ -846,7 +872,49 @@ def predict_image(image, model_name):
     else:
         gradcam_img = image
         
-    return results, gradcam_img
+    # BBox overlay logic
+    bbox_visible_update = gr.update(visible=False)
+    
+    if bbox_filename:
+        sample_path = all_image_paths.get(bbox_filename)
+        if sample_path and os.path.exists(sample_path):
+            try:
+                sample_img = Image.open(sample_path).convert('RGB')
+                # Verify that the currently uploaded image matches the selected sample image
+                if image.size == sample_img.size and np.array_equal(np.array(image), np.array(sample_img)):
+                    bbox_csv_path = os.path.join(DATA_DIR, "BBox_List_2017.csv")
+                    if os.path.exists(bbox_csv_path):
+                        bbox_df = pd.read_csv(bbox_csv_path)
+                        matches = bbox_df[bbox_df['Image Index'] == bbox_filename]
+                        if len(matches) > 0:
+                            draw_img = image.copy()
+                            import PIL.ImageDraw as ImageDraw
+                            draw = ImageDraw.Draw(draw_img)
+                            orig_w, orig_h = draw_img.size
+                            
+                            for _, row in matches.iterrows():
+                                x_1024 = float(row['Bbox [x'])
+                                y_1024 = float(row['y'])
+                                w_1024 = float(row['w'])
+                                h_1024 = float(row['h'])
+                                label = str(row['Finding Label'])
+                                
+                                x = x_1024 * (orig_w / 1024.0)
+                                y = y_1024 * (orig_h / 1024.0)
+                                w = w_1024 * (orig_w / 1024.0)
+                                h = h_1024 * (orig_h / 1024.0)
+                                
+                                draw.rectangle([x, y, x + w, y + h], outline="red", width=4)
+                                text = f"{label} (Radiologist Annotation)"
+                                draw.rectangle([x, max(0, y - 20), x + len(text)*8, max(20, y)], fill="red")
+                                draw.text((x + 4, max(1, y - 18)), text, fill="white")
+                                
+                            bbox_visible_update = gr.update(visible=True, value=draw_img)
+            except Exception as e:
+                print("Error drawing bounding box:", e)
+                print("Error drawing bounding box:", e)
+                
+    return results, detected_text, gradcam_img, bbox_visible_update
 
 with gr.Blocks() as demo:
     gr.Markdown("# NIH Chest X-ray Model Trainer & Predictor")
@@ -882,10 +950,28 @@ with gr.Blocks() as demo:
     with gr.Tab("3. Inference"):
         infer_model_dropdown = gr.Dropdown(choices=[], label="Select Model for Inference")
         with gr.Row():
-            image_input = gr.Image(type="pil", label="Upload X-ray Image")
+            with gr.Column():
+                image_input = gr.Image(type="pil", label="Upload X-ray Image")
+                # Dropdown for selecting sample images with Ground-Truth annotations
+                bbox_sample_dropdown = gr.Dropdown(
+                    choices=bbox_choices if 'bbox_choices' in globals() else [""], 
+                    label="Or Select a Sample with Ground-Truth Annotations",
+                    value=""
+                )
+                threshold_slider = gr.Slider(
+                    minimum=0.05, 
+                    maximum=0.95, 
+                    value=0.50, 
+                    step=0.05, 
+                    label="Decision Threshold (Disease Detection Sensitivity)",
+                    info="Lower values increase sensitivity (more findings), higher values increase specificity (fewer false positives)."
+                )
             with gr.Column():
                 prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
-                gradcam_output = gr.Image(type="pil", label="Grad-CAM Visualization (Targeting Top Diagnosis)")
+                detected_output = gr.Markdown("### Detected Pathologies\n*Run prediction to analyze.*")
+                with gr.Row():
+                    gradcam_output = gr.Image(type="pil", label="Grad-CAM Focus Heatmap")
+                    bbox_output = gr.Image(type="pil", label="Ground-Truth Bounding Box", visible=False)
         predict_btn = gr.Button("Predict Disease", variant="primary")
         
     with gr.Tab("4. Hyperparameter Tuning (Optuna)"):
@@ -935,10 +1021,24 @@ with gr.Blocks() as demo:
     
     demo.load(fn=on_refresh, inputs=None, outputs=[model_dropdown, infer_model_dropdown])
     
+    def on_bbox_sample_change(filename):
+        if not filename:
+            return None
+        img_path = all_image_paths.get(filename)
+        if img_path and os.path.exists(img_path):
+            return Image.open(img_path)
+        return None
+        
+    bbox_sample_dropdown.change(fn=on_bbox_sample_change, inputs=[bbox_sample_dropdown], outputs=[image_input])
+
     model_dropdown.change(fn=get_performance, inputs=[model_dropdown], outputs=[perf_plot, perf_stats])
     infer_model_dropdown.change(fn=lambda x: x, inputs=[infer_model_dropdown], outputs=[model_dropdown])
     
-    predict_btn.click(fn=predict_image, inputs=[image_input, infer_model_dropdown], outputs=[prediction_output, gradcam_output])
+    predict_btn.click(
+        fn=predict_image, 
+        inputs=[image_input, infer_model_dropdown, threshold_slider, bbox_sample_dropdown], 
+        outputs=[prediction_output, detected_output, gradcam_output, bbox_output]
+    )
     
     optuna_balanced_input.change(fn=toggle_balanced_size, inputs=[optuna_balanced_input], outputs=[optuna_balanced_size_input])
     optuna_select_all_btn.click(fn=lambda: gr.update(value=ALL_LABELS), outputs=optuna_diseases_input)
