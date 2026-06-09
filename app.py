@@ -227,9 +227,10 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             dfs = []
             for d in selected_diseases:
                 d_df = df[df['Finding Labels'].str.contains(d)].copy()
-                sample_n = min(len(d_df), sample_size)
-                if sample_n > 0:
-                    dfs.append(d_df.sort_values(['Patient ID', 'Follow-up #']).head(sample_n))
+                if len(d_df) > 0:
+                    sample_n = min(len(d_df), sample_size)
+                    # Random sampling instead of head() to prevent patient cohort selection bias
+                    dfs.append(d_df.sample(n=sample_n, random_state=42))
             if dfs:
                 df = pd.concat(dfs).drop_duplicates().reset_index(drop=True)
             else:
@@ -246,7 +247,24 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         yield log_text, gr.update()
         df = df.reset_index(drop=True)
         
-    msg = f"Training on {len(df)} images for {epochs} epochs with batch size {batch_size}."
+    # Patient-wise Train/Validation Split (80% / 20%) to prevent data leakage and enable checkpoint selection
+    import numpy as np
+    unique_patients = df['Patient ID'].unique()
+    state = np.random.RandomState(42)
+    state.shuffle(unique_patients)
+    
+    if len(unique_patients) >= 5:
+        split_idx = int(len(unique_patients) * 0.8)
+        train_patients = set(unique_patients[:split_idx])
+        val_patients = set(unique_patients[split_idx:])
+        
+        train_df = df[df['Patient ID'].isin(train_patients)].reset_index(drop=True)
+        val_df = df[df['Patient ID'].isin(val_patients)].reset_index(drop=True)
+    else:
+        train_df = df
+        val_df = df
+        
+    msg = f"Dataset split: {len(train_df)} training samples, {len(val_df)} validation samples (on unique patient boundaries)."
     print(msg)
     log_text += msg + "\n"
     yield log_text, gr.update()
@@ -260,8 +278,17 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    dataset = NIHDataset(df, transform=train_transform)
-    dataloader = DataLoader(dataset, batch_size=int(batch_size), shuffle=True)
+    val_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    train_dataset = NIHDataset(train_df, transform=train_transform)
+    val_dataset = NIHDataset(val_df, transform=val_transform)
+    
+    train_loader = DataLoader(train_dataset, batch_size=int(batch_size), shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=int(batch_size), shuffle=False)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     log_text += f"Using device: {device}\n"
@@ -308,9 +335,12 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             {"params": classifier_params, "lr": 1e-3}
         ])
         
-    # Calculate positive weights for highly imbalanced datasets to boost F1-Score (capped at 10.0 for stability)
+    # Learning Rate Scheduler to improve convergence on plateaus
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
+    
+    # Calculate positive weights for highly imbalanced datasets based only on training set to prevent data leakage
     pos_counts = torch.zeros(len(ALL_LABELS))
-    for labels_str in df['Finding Labels']:
+    for labels_str in train_df['Finding Labels']:
         labels = labels_str.split('|')
         for i, l in enumerate(ALL_LABELS):
             if l in labels:
@@ -319,23 +349,25 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     pos_weight = torch.ones(len(ALL_LABELS))
     for i in range(len(ALL_LABELS)):
         if pos_counts[i] > 0:
-            pos_weight[i] = min((len(df) - pos_counts[i]) / pos_counts[i], 10.0)
+            pos_weight[i] = min((len(train_df) - pos_counts[i]) / pos_counts[i], 10.0)
             
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     
-    history = {"loss": [], "accuracy": [], "architecture": architecture}
+    history = {"loss": [], "accuracy": [], "val_accuracy": [], "architecture": architecture}
+    
+    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
+    metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
+    
+    best_val_f1 = 0.0
     
     for epoch in progress.tqdm(range(int(epochs)), desc="Epochs"):
-        # Put entire model in train mode to allow both backbone fine-tuning and dropout regularization
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
-        tp = 0
-        fp = 0
-        fn = 0
+        tp, fp, fn = 0, 0, 0
         
-        for inputs, labels in progress.tqdm(dataloader, desc="Batches"):
+        for inputs, labels in progress.tqdm(train_loader, desc="Batches"):
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
@@ -347,40 +379,48 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             running_loss += loss.item() * inputs.size(0)
             
             preds = (torch.sigmoid(outputs) > 0.5).float()
-            # Calculate standard average binary accuracy per label (proper multi-label metric)
             correct += (preds == labels).float().sum().item()
             total += inputs.size(0) * len(ALL_LABELS)
             
-            # Accumulate TP, FP, FN (Micro F1 metrics) for positive class disease detection
             tp += ((preds == 1) & (labels == 1)).float().sum().item()
             fp += ((preds == 1) & (labels == 0)).float().sum().item()
             fn += ((preds == 0) & (labels == 1)).float().sum().item()
             
         epoch_loss = running_loss / (total / len(ALL_LABELS))
-        
-        # Calculate Micro F1-Score (uninflated disease detection metric)
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
         epoch_f1 = 2 * precision * recall / (precision + recall + 1e-8)
         
+        # Evaluate on Validation set (using evaluate_model function)
+        val_f1 = evaluate_model(model, val_loader, device)
+        
+        # Step the scheduler using validation F1
+        scheduler.step(val_f1)
+        
         history["loss"].append(epoch_loss)
-        history["accuracy"].append(epoch_f1)  # Use F1-Score as the primary Accuracy!
+        history["accuracy"].append(epoch_f1)      # Training F1-Score
+        history["val_accuracy"].append(val_f1)   # Validation F1-Score
         
         msg = f"Epoch [{epoch+1}/{epochs}] -\n"
-        msg += f"  -> Current Training Loss: {epoch_loss:.4f}\n"
-        msg += f"  -> Current Training Accuracy (F1-Score): {epoch_f1 * 100:.2f}%\n"
+        msg += f"  -> Train Loss: {epoch_loss:.4f}\n"
+        msg += f"  -> Train F1-Score: {epoch_f1 * 100:.2f}%\n"
+        msg += f"  -> Val F1-Score: {val_f1 * 100:.2f}%\n"
+        
+        # Save model if validation F1 improves (Checkpoint Selection)
+        if val_f1 > best_val_f1 or epoch == 0:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), model_path)
+            msg += f"  [!] New best validation checkpoint saved! (Val F1: {best_val_f1*100:.2f}%)\n"
+            
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update()
         
-    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
-    metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
-    
-    torch.save(model.state_dict(), model_path)
+    # Save validation metrics
     with open(metrics_path, "w") as f:
         json.dump(history, f)
         
-    log_text += f"Training complete! Model saved as {model_name}.pth\n"
+    log_text += f"Training complete! Best model saved as {model_name}.pth (Best Val F1: {best_val_f1*100:.2f}%)\n"
     yield log_text, update_model_dropdown()
 
 def update_model_dropdown():
@@ -413,14 +453,19 @@ def get_performance(model_name):
         ax2.plot(epochs, [f * 100 for f in history["f1_score"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
         ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='x', linestyle='--', color='gray', alpha=0.6, label="Binary Accuracy (Old)")
         final_acc = history["f1_score"][-1]
+        ax2.set_title("Training Accuracy (F1-Score)")
     else:
         # New scheme: history["accuracy"] is F1-score itself!
-        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
-        final_acc = history["accuracy"][-1]
+        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='green', linewidth=2, label="Train F1-Score")
+        if "val_accuracy" in history:
+            ax2.plot(epochs, [v * 100 for v in history["val_accuracy"]], marker='s', linestyle='--', color='orange', linewidth=2, label="Val F1-Score")
+            final_acc = max(history["val_accuracy"])
+        else:
+            final_acc = history["accuracy"][-1]
+        ax2.set_title("Training & Validation F1-Score")
         
-    ax2.set_title("Training Accuracy (F1-Score)")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Accuracy (%)")
+    ax2.set_ylabel("F1-Score (%)")
     ax2.legend(loc="lower right")
     ax2.grid(True, linestyle='--', alpha=0.5)
     
@@ -428,7 +473,7 @@ def get_performance(model_name):
     
     final_loss = history["loss"][-1]
     arch = history.get("architecture", "Unknown")
-    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Accuracy (F1-Score): {final_acc*100:.2f}%"
+    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Best Val F1-Score: {final_acc*100:.2f}%"
     
     return fig, stats
 
