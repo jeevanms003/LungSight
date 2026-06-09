@@ -15,6 +15,17 @@ import time
 import numpy as np
 import cv2
 
+def apply_clahe(pil_img):
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) to normalize X-ray contrast.
+    This is critical for generalization: X-rays from different machines/sources have wildly different
+    contrast and brightness. CLAHE normalizes them so the model sees consistent features."""
+    img_np = np.array(pil_img.convert('RGB'))
+    lab = cv2.cvtColor(img_np, cv2.COLOR_RGB2LAB)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    result = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    return Image.fromarray(result)
+
 try:
     import optuna
 except ImportError:
@@ -193,6 +204,7 @@ class NIHDataset(Dataset):
         else:
             try:
                 img = Image.open(img_path).convert('RGB')
+                img = apply_clahe(img)
             except:
                 img = Image.new('RGB', (224, 224))
             
@@ -270,10 +282,13 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     yield log_text, gr.update()
     
     train_transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.RandomRotation(degrees=10),
+        transforms.Resize((256, 256)),
+        transforms.RandomCrop(224),
+        transforms.RandomRotation(degrees=15),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -870,19 +885,60 @@ def predict_image(image, model_name, threshold, bbox_filename):
         param.requires_grad = True
     model.eval()
     
-    transform = transforms.Compose([
+    base_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    image = image.convert('RGB')
-    img_t = transform(image).unsqueeze(0).to(device)
-    img_t.requires_grad = True
     
-    outputs = model(img_t)
-    probs = torch.sigmoid(outputs).squeeze().detach().cpu().numpy()
-    if probs.ndim == 0:
-        probs = [probs.item()]
+    # TTA augmentation transforms for robust inference on unknown images
+    tta_transforms = [
+        base_transform,
+        transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(p=1.0),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomRotation(degrees=5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+    ]
+    
+    image = image.convert('RGB')
+    # Apply CLAHE to normalize contrast from unknown X-ray sources
+    image = apply_clahe(image)
+    
+    # Test-Time Augmentation: average predictions across multiple augmented views
+    all_probs = []
+    for tta_tf in tta_transforms:
+        img_t = tta_tf(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = model(img_t)
+        p = torch.sigmoid(out).squeeze().cpu().numpy()
+        if p.ndim == 0:
+            p = np.array([p.item()])
+        all_probs.append(p)
+    probs = np.mean(all_probs, axis=0)
+    
+    # Re-run the base transform WITH gradients for Grad-CAM
+    img_t = base_transform(image).unsqueeze(0).to(device)
+    img_t.requires_grad = True
         
     results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
     
@@ -974,7 +1030,7 @@ with gr.Blocks() as demo:
             batch_size_input = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="Batch Size")
         with gr.Row():
             balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
-            balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
+            balanced_size_input = gr.Dropdown(choices=["100", "200", "500", "1000", "2000", "5000"], value="500", label="Balanced Sample Size (images per selected disease)", visible=True)
         with gr.Row():
             with gr.Column():
                 diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
