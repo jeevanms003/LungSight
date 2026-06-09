@@ -744,10 +744,11 @@ def generate_gradcam(model, img_tensor, target_class_idx, architecture):
     h_b = target_layer.register_full_backward_hook(backward_hook)
     
     try:
-        output = model(img_tensor)
-        score = output[0, target_class_idx]
-        model.zero_grad()
-        score.backward()
+        with torch.enable_grad():
+            output = model(img_tensor)
+            score = output[0, target_class_idx]
+            model.zero_grad()
+            score.backward()
         
         if not features or not gradients:
             return None
