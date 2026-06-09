@@ -781,7 +781,7 @@ with gr.Blocks() as demo:
             batch_size_input = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="Batch Size")
         with gr.Row():
             balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
-            balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
+            balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200", "500", "1000", "2000", "5000"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
         with gr.Row():
             with gr.Column():
                 diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
@@ -817,7 +817,7 @@ with gr.Blocks() as demo:
                 optuna_batch_input = gr.CheckboxGroup(choices=["8", "16", "32"], value=["16", "32"], label="Batch Sizes to Search")
             with gr.Column():
                 optuna_balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
-                optuna_balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200"], value="100", label="Balanced Sample Size (images per selected disease)")
+                optuna_balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200", "500", "1000", "2000", "5000"], value="100", label="Balanced Sample Size (images per selected disease)")
                 optuna_diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases", info="Select specific diseases to train on a targeted subset.")
                 with gr.Row():
                     optuna_select_all_btn = gr.Button("Select All")
