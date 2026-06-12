@@ -585,7 +585,7 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
     
     # Optuna study Setup
     db_path = os.path.abspath(os.path.join(MODELS_DIR, "optuna_studies.db"))
-    db_path_url = db_path.replace("\\", "/")
+    db_path_url = db_path.replace(os.sep, '/')
     storage_url = f"sqlite:///{db_path_url}"
     
     study = optuna.create_study(
@@ -819,7 +819,7 @@ def get_optuna_studies():
     if not os.path.exists(db_path):
         return []
     try:
-        db_path_url = db_path.replace("\\", "/")
+        db_path_url = db_path.replace(os.sep, '/')
         storage_url = f"sqlite:///{db_path_url}"
         summaries = optuna.get_all_study_summaries(storage=storage_url)
         return [s.study_name for s in summaries]
@@ -832,7 +832,7 @@ def get_optuna_study_details(study_name):
         return "No Optuna library or study name selected.", None, None
         
     db_path = os.path.abspath(os.path.join(MODELS_DIR, "optuna_studies.db"))
-    db_path_url = db_path.replace("\\", "/")
+    db_path_url = db_path.replace(os.sep, '/')
     storage_url = f"sqlite:///{db_path_url}"
     
     try:
