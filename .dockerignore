@@ -1,0 +1,17 @@
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+models/
+*.pth
+*_metrics.json
+images_*/
+images_0*/
+images_1*/

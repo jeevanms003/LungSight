@@ -18,7 +18,7 @@ try:
 except ImportError:
     optuna = None
 
-DATA_DIR = r"d:\NIH_Chest_Xray_Project"
+DATA_DIR = os.environ.get("DATA_DIR", r"d:\NIH_Chest_Xray_Project")
 CSV_PATH = os.path.join(DATA_DIR, "Data_Entry_2017.csv")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -1112,4 +1112,6 @@ with gr.Blocks() as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, share=False)
+    server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
+    server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+    demo.launch(server_name=server_name, server_port=server_port, share=False)
