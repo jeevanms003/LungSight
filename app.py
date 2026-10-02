@@ -172,8 +172,7 @@ class HybridModel(nn.Module):
         combined = torch.cat((r_feat, m_feat, d_feat), dim=1)
         return self.classifier(combined)
 
-def get_model(model_type="ResNet-18"):
-    num_classes = len(ALL_LABELS)
+def get_model(model_type="ResNet-18", num_classes=len(ALL_LABELS)):
     if model_type == "MobileNet-V2":
         model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
         model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
@@ -199,9 +198,10 @@ def get_model(model_type="ResNet-18"):
 # Dataset
 # ---------------------------------------------------------------------------
 class NIHDataset(Dataset):
-    def __init__(self, df, transform=None):
+    def __init__(self, df, transform=None, target_labels=ALL_LABELS):
         self.df = df
         self.transform = transform
+        self.target_labels = target_labels
         
     def __len__(self):
         return len(self.df)
@@ -219,8 +219,8 @@ class NIHDataset(Dataset):
                 img = Image.new('RGB', (224, 224))
             
         labels = row['Finding Labels'].split('|')
-        label_tensor = torch.zeros(len(ALL_LABELS))
-        for i, l in enumerate(ALL_LABELS):
+        label_tensor = torch.zeros(len(self.target_labels))
+        for i, l in enumerate(self.target_labels):
             if l in labels:
                 label_tensor[i] = 1.0
                 
@@ -232,17 +232,17 @@ class NIHDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Helper: compute pos_weight for BCEWithLogitsLoss
 # ---------------------------------------------------------------------------
-def compute_pos_weight(df_labels_series, device):
+def compute_pos_weight(df_labels_series, target_labels, device):
     n = len(df_labels_series)
-    pos_counts = torch.zeros(len(ALL_LABELS))
+    pos_counts = torch.zeros(len(target_labels))
     for labels_str in df_labels_series:
-        for i, l in enumerate(ALL_LABELS):
+        for i, l in enumerate(target_labels):
             if l in labels_str.split('|'):
                 pos_counts[i] += 1
-    pos_weight = torch.ones(len(ALL_LABELS))
-    for i in range(len(ALL_LABELS)):
+    pos_weight = torch.ones(len(target_labels))
+    for i in range(len(target_labels)):
         if pos_counts[i] > 0:
-            pos_weight[i] = min((n - pos_counts[i]) / pos_counts[i], 10.0)
+            pos_weight[i] = min((n - pos_counts[i]) / pos_counts[i], 3.0)
     return pos_weight.to(device)
 
 # ---------------------------------------------------------------------------
@@ -265,12 +265,11 @@ def patient_split(df, val_frac=0.2, seed=42):
 # ---------------------------------------------------------------------------
 # Helper: build optimizer with differential LR
 # ---------------------------------------------------------------------------
-def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-5, classifier_lr=1e-3):
+def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-4, classifier_lr=1e-3):
     backbone_params = []
     classifier_params = []
     classifier_layer_name = "fc" if architecture == "ResNet-18" else "classifier"
     if architecture == "Simple CNN":
-        # Simple CNN has no separate backbone — train everything at classifier_lr
         params = list(model.parameters())
         pg = [{"params": params, "lr": classifier_lr}]
     else:
@@ -301,9 +300,9 @@ def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-5, clas
 # evaluate_model  (used by Optuna and train loop)
 # ---------------------------------------------------------------------------
 def evaluate_model(model, dataloader, device, criterion=None):
-    """Returns (f1, avg_loss). Loss is None if criterion not provided."""
+    """Returns (f1, avg_loss, acc). Loss is None if criterion not provided."""
     model.eval()
-    tp, fp, fn = 0, 0, 0
+    tp, fp, fn, tn = 0, 0, 0, 0
     total_loss = 0.0
     n_batches = 0
     with torch.no_grad():
@@ -317,11 +316,13 @@ def evaluate_model(model, dataloader, device, criterion=None):
             tp += ((preds == 1) & (labels == 1)).float().sum().item()
             fp += ((preds == 1) & (labels == 0)).float().sum().item()
             fn += ((preds == 0) & (labels == 1)).float().sum().item()
+            tn += ((preds == 0) & (labels == 0)).float().sum().item()
     precision = tp / (tp + fp + 1e-8)
     recall    = tp / (tp + fn + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    acc = (tp + tn) / (tp + tn + fp + fn + 1e-8)
     avg_loss = (total_loss / n_batches) if n_batches > 0 else None
-    return f1, avg_loss
+    return f1, avg_loss, acc
 
 # ---------------------------------------------------------------------------
 # TRAIN MODEL  (main fix: val split, augmentation, best-val save, LR scheduler)
@@ -337,10 +338,14 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     checkpoint_path = os.path.join(MODELS_DIR, f"{model_name}_checkpoint.pth")
     checkpoint = None
     start_epoch = 0
+    target_labels = selected_diseases if (selected_diseases and len(selected_diseases) > 0) else ALL_LABELS
+    
     history = {
         "loss": [], "val_loss": [],
         "accuracy": [], "val_accuracy": [],
-        "architecture": architecture
+        "f1": [], "val_f1": [],
+        "architecture": architecture,
+        "target_labels": target_labels
     }
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -376,7 +381,6 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
                 d_df = df[df['Finding Labels'].str.contains(d, regex=False)].copy()
                 sample_n = min(len(d_df), sample_size)
                 if sample_n > 0:
-                    # FIX: random sample instead of head() to avoid always picking same patients
                     dfs.append(d_df.sample(n=sample_n, random_state=42))
             if dfs:
                 df = pd.concat(dfs).drop_duplicates().reset_index(drop=True)
@@ -394,18 +398,14 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         yield log_text, gr.update(), gr.update()
         df = df.reset_index(drop=True)
 
-    # -----------------------------------------------------------------------
-    # FIX: Patient-level train/val split (prevents data leakage)
-    # -----------------------------------------------------------------------
     if 'Patient ID' in df.columns and len(df) >= 10:
         train_df, val_df = patient_split(df, val_frac=0.2, seed=42)
     else:
-        # Fallback: random split when Patient ID is not available
         train_df = df.sample(frac=0.8, random_state=42).reset_index(drop=True)
         val_df   = df.drop(train_df.index).reset_index(drop=True)
 
     msg = (f"Training on {len(train_df)} images | Validating on {len(val_df)} images | "
-           f"{epochs} epochs | batch size {int(batch_size)}.")
+           f"Target Diseases: {len(target_labels)} | {epochs} epochs | batch size {int(batch_size)}.")
     print(msg)
     log_text += msg + "\n"
     yield log_text, gr.update(), gr.update()
@@ -413,31 +413,22 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     log_text += f"Using device: {device}\n"
     yield log_text, gr.update(), gr.update()
     
-    model = get_model(architecture).to(device)
+    model = get_model(architecture, num_classes=len(target_labels)).to(device)
     
-    # All parameters trainable so the backbone adapts to X-ray details
     for param in model.parameters():
         param.requires_grad = True
         
-    # -----------------------------------------------------------------------
-    # Build optimizer with differential learning rates
-    # -----------------------------------------------------------------------
+    b_lr = 1e-5 if len(train_df) < 500 else 5e-5
     if architecture == "Simple CNN":
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     else:
         optimizer = build_optimizer(model, architecture, opt_name="Adam",
-                                    backbone_lr=1e-5, classifier_lr=1e-3)
+                                    backbone_lr=b_lr, classifier_lr=1e-3)
 
-    # -----------------------------------------------------------------------
-    # FIX: LR Scheduler — CosineAnnealingLR for smooth convergence
-    # -----------------------------------------------------------------------
     total_epochs = int(epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
 
-    # -----------------------------------------------------------------------
-    # Weighted loss to handle class imbalance
-    # -----------------------------------------------------------------------
-    pos_weight = compute_pos_weight(train_df['Finding Labels'], device)
+    pos_weight = compute_pos_weight(train_df['Finding Labels'], target_labels, device)
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
     if checkpoint is not None:
@@ -454,25 +445,18 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             log_text += f"Failed to load checkpoint weights ({e}). Starting from scratch.\n"
             yield log_text, gr.update(), gr.update()
 
-    # -----------------------------------------------------------------------
-    # FIX: Use TRAIN_TRANSFORM (with augmentation) for training
-    #       Use INFER_TRANSFORM (no augmentation) for validation
-    # -----------------------------------------------------------------------
-    train_dataset = NIHDataset(train_df, transform=TRAIN_TRANSFORM)
-    val_dataset   = NIHDataset(val_df,   transform=INFER_TRANSFORM)
+    train_dataset = NIHDataset(train_df, transform=TRAIN_TRANSFORM, target_labels=target_labels)
+    val_dataset   = NIHDataset(val_df,   transform=INFER_TRANSFORM, target_labels=target_labels)
     train_loader  = DataLoader(train_dataset, batch_size=int(batch_size), shuffle=True,  num_workers=0, pin_memory=False)
     val_loader    = DataLoader(val_dataset,   batch_size=int(batch_size), shuffle=False, num_workers=0, pin_memory=False)
 
-    # -----------------------------------------------------------------------
-    # FIX: Save best val model, not just the last epoch
-    # -----------------------------------------------------------------------
     best_val_f1   = -1.0
     best_model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
 
     for epoch in progress.tqdm(range(start_epoch, total_epochs), desc="Epochs"):
         model.train()
         running_loss = 0.0
-        tp = fp = fn = 0
+        tp = fp = fn = tn = 0
         total_samples = 0
         
         for inputs, labels in progress.tqdm(train_loader, desc="Batches"):
@@ -491,6 +475,7 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             tp += ((preds == 1) & (labels == 1)).float().sum().item()
             fp += ((preds == 1) & (labels == 0)).float().sum().item()
             fn += ((preds == 0) & (labels == 1)).float().sum().item()
+            tn += ((preds == 0) & (labels == 0)).float().sum().item()
             
         scheduler.step()
 
@@ -498,32 +483,49 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         precision  = tp / (tp + fp + 1e-8)
         recall     = tp / (tp + fn + 1e-8)
         epoch_f1   = 2 * precision * recall / (precision + recall + 1e-8)
+        epoch_acc  = (tp + tn) / (tp + tn + fp + fn + 1e-8)
 
-        # -----------------------------------------------------------------------
-        # FIX: Compute validation metrics every epoch
-        # -----------------------------------------------------------------------
-        val_f1, val_loss = evaluate_model(model, val_loader, device, criterion)
+        val_f1, val_loss, val_acc = evaluate_model(model, val_loader, device, criterion)
 
         history["loss"].append(epoch_loss)
         history["val_loss"].append(val_loss if val_loss is not None else 0.0)
-        history["accuracy"].append(epoch_f1)
-        history["val_accuracy"].append(val_f1)
+        history["accuracy"].append(epoch_acc)
+        history["val_accuracy"].append(val_acc)
+        history["f1"] = history.get("f1", []) + [epoch_f1]
+        history["val_f1"] = history.get("val_f1", []) + [val_f1]
         
         msg  = f"Epoch [{epoch+1}/{total_epochs}]\n"
-        msg += f"  -> Train Loss: {epoch_loss:.4f}  |  Train F1: {epoch_f1 * 100:.2f}%\n"
-        msg += f"  -> Val   Loss: {val_loss:.4f}  |  Val   F1: {val_f1 * 100:.2f}%\n"
+        msg += f"  -> Train Loss: {epoch_loss:.4f}  |  Train Acc: {epoch_acc * 100:.2f}%  |  Train F1: {epoch_f1 * 100:.2f}%\n"
+        msg += f"  -> Val   Loss: {val_loss:.4f}  |  Val   Acc: {val_acc * 100:.2f}%  |  Val   F1: {val_f1 * 100:.2f}%\n"
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update(), gr.update()
 
-        # -----------------------------------------------------------------------
-        # FIX: Save best-validation model weights
-        # -----------------------------------------------------------------------
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
             torch.save(model.state_dict(), best_model_path)
-            log_text += f"  ✅ New best val F1: {best_val_f1 * 100:.2f}% — model saved.\n"
+            log_text += f"  ✅ New best val F1: {best_val_f1 * 100:.2f}% (Acc: {val_acc * 100:.2f}%) — model saved.\n"
             yield log_text, gr.update(), gr.update()
+        
+        try:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'history': history,
+                'config': {
+                    'architecture': architecture,
+                    'epochs': epochs,
+                    'batch_size': batch_size,
+                    'selected_diseases': selected_diseases,
+                    'target_labels': target_labels,
+                    'balanced_sampling': balanced_sampling,
+                    'balanced_size': balanced_size
+                }
+            }, checkpoint_path)
+        except Exception as e:
+            print(f"Error saving checkpoint: {e}")
         
         # Save epoch checkpoint (for crash recovery)
         try:
@@ -842,21 +844,22 @@ def predict_image(image, model_name):
         return "Model file not found."
     
     arch = "ResNet-18"
+    target_labels = ALL_LABELS
     if os.path.exists(metrics_path):
         try:
             with open(metrics_path, "r") as f:
                 meta = json.load(f)
                 arch = meta.get("architecture", "ResNet-18")
+                target_labels = meta.get("target_labels", ALL_LABELS)
         except:
             pass
         
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model  = get_model(arch)
+    model  = get_model(arch, num_classes=len(target_labels))
     load_compat_state_dict(model, torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
     model.eval()
     
-    # FIX: Use the same INFER_TRANSFORM as validation — no augmentation
     image = image.convert('RGB')
     img_t = INFER_TRANSFORM(image).unsqueeze(0).to(device)
     
@@ -866,7 +869,7 @@ def predict_image(image, model_name):
         if probs.ndim == 0:
             probs = [probs.item()]
         
-    results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
+    results = {label: float(prob) for label, prob in zip(target_labels, probs)}
     return results
 
 # ---------------------------------------------------------------------------
