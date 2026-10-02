@@ -454,6 +454,7 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     val_loader    = DataLoader(val_dataset,   batch_size=int(batch_size), shuffle=False, num_workers=0, pin_memory=False)
 
     best_val_f1   = -1.0
+    epochs_no_improve = 0
     best_model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
 
     for epoch in progress.tqdm(range(start_epoch, total_epochs), desc="Epochs"):
@@ -506,9 +507,17 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
+            epochs_no_improve = 0
             torch.save(model.state_dict(), best_model_path)
             log_text += f"  ✅ New best val F1: {best_val_f1 * 100:.2f}% (Acc: {val_acc * 100:.2f}%) — model saved.\n"
             yield log_text, gr.update(), gr.update()
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= 8:
+                log_text += f"\n🛑 Early stopping triggered at epoch {epoch+1} (no val F1 improvement for 8 consecutive epochs).\n"
+                log_text += f"Best val F1 preserved: {best_val_f1 * 100:.2f}%.\n"
+                yield log_text, gr.update(), gr.update()
+                break
         
         try:
             torch.save({
