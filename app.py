@@ -12,6 +12,7 @@ import json
 import matplotlib.pyplot as plt
 import io
 import time
+import random
 
 try:
     import optuna
@@ -36,10 +37,35 @@ for i in range(1, 13):
         all_image_paths[os.path.basename(p)] = p
 print(f"Loaded {len(all_image_paths)} image paths.")
 
+# ---------------------------------------------------------------------------
+# Preprocessing transforms
+# ---------------------------------------------------------------------------
+# Training: includes augmentation to improve generalization on unseen data
+TRAIN_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.RandomAffine(degrees=0, translate=(0.05, 0.05)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# Validation / Inference: deterministic — no augmentation
+INFER_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# ---------------------------------------------------------------------------
+# Utility: load state dict with key-name compatibility
+# ---------------------------------------------------------------------------
 def load_compat_state_dict(model, state_dict):
     """
     Loads state_dict into model, dynamically adapting between older format (nn.Linear)
     and newer format (nn.Sequential(nn.Dropout, nn.Linear)).
+    Logs any keys that could not be matched so failures are visible.
     """
     model_state = model.state_dict()
     new_state = {}
@@ -68,8 +94,15 @@ def load_compat_state_dict(model, state_dict):
                 new_state[k] = v
         else:
             new_state[k] = v
-    model.load_state_dict(new_state, strict=False)
+    result = model.load_state_dict(new_state, strict=False)
+    if result.missing_keys:
+        print(f"[load_compat_state_dict] Missing keys (will use random init): {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"[load_compat_state_dict] Unexpected keys (ignored): {result.unexpected_keys}")
 
+# ---------------------------------------------------------------------------
+# Model definitions
+# ---------------------------------------------------------------------------
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -162,6 +195,9 @@ def get_model(model_type="ResNet-18"):
         )
     return model
 
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
 class NIHDataset(Dataset):
     def __init__(self, df, transform=None):
         self.df = df
@@ -193,6 +229,103 @@ class NIHDataset(Dataset):
             
         return img, label_tensor
 
+# ---------------------------------------------------------------------------
+# Helper: compute pos_weight for BCEWithLogitsLoss
+# ---------------------------------------------------------------------------
+def compute_pos_weight(df_labels_series, device):
+    n = len(df_labels_series)
+    pos_counts = torch.zeros(len(ALL_LABELS))
+    for labels_str in df_labels_series:
+        for i, l in enumerate(ALL_LABELS):
+            if l in labels_str.split('|'):
+                pos_counts[i] += 1
+    pos_weight = torch.ones(len(ALL_LABELS))
+    for i in range(len(ALL_LABELS)):
+        if pos_counts[i] > 0:
+            pos_weight[i] = min((n - pos_counts[i]) / pos_counts[i], 10.0)
+    return pos_weight.to(device)
+
+# ---------------------------------------------------------------------------
+# Helper: patient-aware train/val split
+# ---------------------------------------------------------------------------
+def patient_split(df, val_frac=0.2, seed=42):
+    """
+    Splits df at patient level so no patient appears in both train and val.
+    This prevents data leakage when the same patient has multiple X-rays.
+    """
+    patients = df['Patient ID'].unique().tolist()
+    random.seed(seed)
+    random.shuffle(patients)
+    n_val = max(1, int(len(patients) * val_frac))
+    val_patients = set(patients[:n_val])
+    train_df = df[~df['Patient ID'].isin(val_patients)].reset_index(drop=True)
+    val_df   = df[ df['Patient ID'].isin(val_patients)].reset_index(drop=True)
+    return train_df, val_df
+
+# ---------------------------------------------------------------------------
+# Helper: build optimizer with differential LR
+# ---------------------------------------------------------------------------
+def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-5, classifier_lr=1e-3):
+    backbone_params = []
+    classifier_params = []
+    classifier_layer_name = "fc" if architecture == "ResNet-18" else "classifier"
+    if architecture == "Simple CNN":
+        # Simple CNN has no separate backbone — train everything at classifier_lr
+        params = list(model.parameters())
+        pg = [{"params": params, "lr": classifier_lr}]
+    else:
+        for name, param in model.named_parameters():
+            if classifier_layer_name in name:
+                classifier_params.append(param)
+            else:
+                backbone_params.append(param)
+        pg = [
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": classifier_params, "lr": classifier_lr}
+        ]
+
+    opt_map = {
+        "Adam":    torch.optim.Adam,
+        "AdamW":   torch.optim.AdamW,
+        "RMSprop": torch.optim.RMSprop,
+        "Adagrad": torch.optim.Adagrad,
+    }
+    if opt_name in opt_map:
+        return opt_map[opt_name](pg)
+    elif opt_name == "SGD":
+        return torch.optim.SGD(pg, momentum=0.9)
+    else:
+        return torch.optim.Adam(pg)
+
+# ---------------------------------------------------------------------------
+# evaluate_model  (used by Optuna and train loop)
+# ---------------------------------------------------------------------------
+def evaluate_model(model, dataloader, device, criterion=None):
+    """Returns (f1, avg_loss). Loss is None if criterion not provided."""
+    model.eval()
+    tp, fp, fn = 0, 0, 0
+    total_loss = 0.0
+    n_batches = 0
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            if criterion is not None:
+                total_loss += criterion(outputs, labels).item()
+                n_batches += 1
+            preds = (torch.sigmoid(outputs) > 0.5).float()
+            tp += ((preds == 1) & (labels == 1)).float().sum().item()
+            fp += ((preds == 1) & (labels == 0)).float().sum().item()
+            fn += ((preds == 0) & (labels == 1)).float().sum().item()
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    avg_loss = (total_loss / n_batches) if n_batches > 0 else None
+    return f1, avg_loss
+
+# ---------------------------------------------------------------------------
+# TRAIN MODEL  (main fix: val split, augmentation, best-val save, LR scheduler)
+# ---------------------------------------------------------------------------
 def train_model(model_name, architecture, epochs, batch_size, selected_diseases, balanced_sampling, balanced_size, progress=gr.Progress()):
     if not model_name:
         model_name = f"model_{int(time.time())}"
@@ -204,7 +337,11 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
     checkpoint_path = os.path.join(MODELS_DIR, f"{model_name}_checkpoint.pth")
     checkpoint = None
     start_epoch = 0
-    history = {"loss": [], "accuracy": [], "architecture": architecture}
+    history = {
+        "loss": [], "val_loss": [],
+        "accuracy": [], "val_accuracy": [],
+        "architecture": architecture
+    }
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -213,11 +350,11 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             checkpoint = torch.load(checkpoint_path, map_location=device)
             if 'config' in checkpoint:
                 cfg = checkpoint['config']
-                architecture = cfg.get('architecture', architecture)
-                batch_size = int(cfg.get('batch_size', batch_size))
+                architecture    = cfg.get('architecture', architecture)
+                batch_size      = int(cfg.get('batch_size', batch_size))
                 selected_diseases = cfg.get('selected_diseases', selected_diseases)
                 balanced_sampling = cfg.get('balanced_sampling', balanced_sampling)
-                balanced_size = cfg.get('balanced_size', balanced_size)
+                balanced_size   = cfg.get('balanced_size', balanced_size)
             log_text += f"Found existing checkpoint for '{model_name}'. Loaded config: Arch={architecture}, Batch Size={batch_size}.\n"
             yield log_text, gr.update(), gr.update()
         except Exception as e:
@@ -236,10 +373,11 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
             yield log_text, gr.update(), gr.update()
             dfs = []
             for d in selected_diseases:
-                d_df = df[df['Finding Labels'].str.contains(d)].copy()
+                d_df = df[df['Finding Labels'].str.contains(d, regex=False)].copy()
                 sample_n = min(len(d_df), sample_size)
                 if sample_n > 0:
-                    dfs.append(d_df.sort_values(['Patient ID', 'Follow-up #']).head(sample_n))
+                    # FIX: random sample instead of head() to avoid always picking same patients
+                    dfs.append(d_df.sample(n=sample_n, random_state=42))
             if dfs:
                 df = pd.concat(dfs).drop_duplicates().reset_index(drop=True)
             else:
@@ -247,7 +385,7 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
                 yield log_text, update_model_dropdown(), update_checkpoint_dropdown()
                 return
         else:
-            log_text += f"Using all matching images for the selected diseases...\n"
+            log_text += "Using all matching images for the selected diseases...\n"
             yield log_text, gr.update(), gr.update()
             mask = df['Finding Labels'].apply(lambda x: any(d in x for d in selected_diseases))
             df = df[mask].reset_index(drop=True)
@@ -255,146 +393,145 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         log_text += f"No diseases selected. Training on the entire dataset of {len(df)} images...\n"
         yield log_text, gr.update(), gr.update()
         df = df.reset_index(drop=True)
-        
-    msg = f"Training on {len(df)} images for {epochs} epochs with batch size {batch_size}."
+
+    # -----------------------------------------------------------------------
+    # FIX: Patient-level train/val split (prevents data leakage)
+    # -----------------------------------------------------------------------
+    if 'Patient ID' in df.columns and len(df) >= 10:
+        train_df, val_df = patient_split(df, val_frac=0.2, seed=42)
+    else:
+        # Fallback: random split when Patient ID is not available
+        train_df = df.sample(frac=0.8, random_state=42).reset_index(drop=True)
+        val_df   = df.drop(train_df.index).reset_index(drop=True)
+
+    msg = (f"Training on {len(train_df)} images | Validating on {len(val_df)} images | "
+           f"{epochs} epochs | batch size {int(batch_size)}.")
     print(msg)
     log_text += msg + "\n"
     yield log_text, gr.update(), gr.update()
-    
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    dataset = NIHDataset(df, transform=transform)
-    dataloader = DataLoader(dataset, batch_size=int(batch_size), shuffle=True)
     
     log_text += f"Using device: {device}\n"
     yield log_text, gr.update(), gr.update()
     
     model = get_model(architecture).to(device)
     
-    # Ensure ALL parameters are fully trainable (requires_grad = True) so the backbone adapts to X-ray details
+    # All parameters trainable so the backbone adapts to X-ray details
     for param in model.parameters():
         param.requires_grad = True
         
-    # Configure optimizer with differential learning rates for pretrained models
+    # -----------------------------------------------------------------------
+    # Build optimizer with differential learning rates
+    # -----------------------------------------------------------------------
     if architecture == "Simple CNN":
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    elif architecture == "Hybrid Model":
-        backbone_params = []
-        classifier_params = []
-        for name, param in model.named_parameters():
-            if "classifier" in name:
-                classifier_params.append(param)
-            else:
-                backbone_params.append(param)
-        optimizer = torch.optim.Adam([
-            {"params": backbone_params, "lr": 1e-5},
-            {"params": classifier_params, "lr": 1e-3}
-        ])
     else:
-        # Pretrained models: ResNet-18, MobileNet-V2, DenseNet-121
-        # Set up differential learning rates: 1e-5 for backbone (slow, stable fine-tuning), 1e-3 for classifier (fast learning)
-        backbone_params = []
-        classifier_params = []
-        
-        # Identify the classifier layer name
-        classifier_name = "fc" if architecture == "ResNet-18" else "classifier"
-        
-        for name, param in model.named_parameters():
-            if classifier_name in name:
-                classifier_params.append(param)
-            else:
-                backbone_params.append(param)
-                
-        optimizer = torch.optim.Adam([
-            {"params": backbone_params, "lr": 1e-5},
-            {"params": classifier_params, "lr": 1e-3}
-        ])
-        
-    # Calculate positive weights for highly imbalanced datasets to boost F1-Score (capped at 10.0 for stability)
-    pos_counts = torch.zeros(len(ALL_LABELS))
-    for labels_str in df['Finding Labels']:
-        labels = labels_str.split('|')
-        for i, l in enumerate(ALL_LABELS):
-            if l in labels:
-                pos_counts[i] += 1
-                
-    pos_weight = torch.ones(len(ALL_LABELS))
-    for i in range(len(ALL_LABELS)):
-        if pos_counts[i] > 0:
-            pos_weight[i] = min((len(df) - pos_counts[i]) / pos_counts[i], 10.0)
-            
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+        optimizer = build_optimizer(model, architecture, opt_name="Adam",
+                                    backbone_lr=1e-5, classifier_lr=1e-3)
+
+    # -----------------------------------------------------------------------
+    # FIX: LR Scheduler — CosineAnnealingLR for smooth convergence
+    # -----------------------------------------------------------------------
+    total_epochs = int(epochs)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+
+    # -----------------------------------------------------------------------
+    # Weighted loss to handle class imbalance
+    # -----------------------------------------------------------------------
+    pos_weight = compute_pos_weight(train_df['Finding Labels'], device)
+    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
     if checkpoint is not None:
         try:
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
-            history = checkpoint['history']
-            log_text += f"Resumed training weights from epoch {start_epoch + 1}...\n"
+            history = checkpoint.get('history', history)
+            log_text += f"Resumed training weights from epoch {start_epoch}...\n"
             yield log_text, gr.update(), gr.update()
         except Exception as e:
-            log_text += f"Failed to load checkpoint weights ({e}). Starting training from scratch.\n"
+            log_text += f"Failed to load checkpoint weights ({e}). Starting from scratch.\n"
             yield log_text, gr.update(), gr.update()
-            
-    for epoch in progress.tqdm(range(start_epoch, int(epochs)), desc="Epochs"):
-        # Put entire model in train mode to allow both backbone fine-tuning and dropout regularization
+
+    # -----------------------------------------------------------------------
+    # FIX: Use TRAIN_TRANSFORM (with augmentation) for training
+    #       Use INFER_TRANSFORM (no augmentation) for validation
+    # -----------------------------------------------------------------------
+    train_dataset = NIHDataset(train_df, transform=TRAIN_TRANSFORM)
+    val_dataset   = NIHDataset(val_df,   transform=INFER_TRANSFORM)
+    train_loader  = DataLoader(train_dataset, batch_size=int(batch_size), shuffle=True,  num_workers=0, pin_memory=False)
+    val_loader    = DataLoader(val_dataset,   batch_size=int(batch_size), shuffle=False, num_workers=0, pin_memory=False)
+
+    # -----------------------------------------------------------------------
+    # FIX: Save best val model, not just the last epoch
+    # -----------------------------------------------------------------------
+    best_val_f1   = -1.0
+    best_model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
+
+    for epoch in progress.tqdm(range(start_epoch, total_epochs), desc="Epochs"):
         model.train()
         running_loss = 0.0
-        correct = 0
-        total = 0
-        tp = 0
-        fp = 0
-        fn = 0
+        tp = fp = fn = 0
+        total_samples = 0
         
-        for inputs, labels in progress.tqdm(dataloader, desc="Batches"):
+        for inputs, labels in progress.tqdm(train_loader, desc="Batches"):
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss    = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
             
             running_loss += loss.item() * inputs.size(0)
+            total_samples += inputs.size(0)
             
             preds = (torch.sigmoid(outputs) > 0.5).float()
-            # Calculate standard average binary accuracy per label (proper multi-label metric)
-            correct += (preds == labels).float().sum().item()
-            total += inputs.size(0) * len(ALL_LABELS)
-            
-            # Accumulate TP, FP, FN (Micro F1 metrics) for positive class disease detection
             tp += ((preds == 1) & (labels == 1)).float().sum().item()
             fp += ((preds == 1) & (labels == 0)).float().sum().item()
             fn += ((preds == 0) & (labels == 1)).float().sum().item()
             
-        epoch_loss = running_loss / (total / len(ALL_LABELS))
-        
-        # Calculate Micro F1-Score (uninflated disease detection metric)
-        precision = tp / (tp + fp + 1e-8)
-        recall = tp / (tp + fn + 1e-8)
-        epoch_f1 = 2 * precision * recall / (precision + recall + 1e-8)
-        
+        scheduler.step()
+
+        epoch_loss = running_loss / (total_samples + 1e-8)
+        precision  = tp / (tp + fp + 1e-8)
+        recall     = tp / (tp + fn + 1e-8)
+        epoch_f1   = 2 * precision * recall / (precision + recall + 1e-8)
+
+        # -----------------------------------------------------------------------
+        # FIX: Compute validation metrics every epoch
+        # -----------------------------------------------------------------------
+        val_f1, val_loss = evaluate_model(model, val_loader, device, criterion)
+
         history["loss"].append(epoch_loss)
-        history["accuracy"].append(epoch_f1)  # Use F1-Score as the primary Accuracy!
+        history["val_loss"].append(val_loss if val_loss is not None else 0.0)
+        history["accuracy"].append(epoch_f1)
+        history["val_accuracy"].append(val_f1)
         
-        msg = f"Epoch [{epoch+1}/{epochs}] -\n"
-        msg += f"  -> Current Training Loss: {epoch_loss:.4f}\n"
-        msg += f"  -> Current Training Accuracy (F1-Score): {epoch_f1 * 100:.2f}%\n"
+        msg  = f"Epoch [{epoch+1}/{total_epochs}]\n"
+        msg += f"  -> Train Loss: {epoch_loss:.4f}  |  Train F1: {epoch_f1 * 100:.2f}%\n"
+        msg += f"  -> Val   Loss: {val_loss:.4f}  |  Val   F1: {val_f1 * 100:.2f}%\n"
         print(msg)
         log_text += msg + "\n"
         yield log_text, gr.update(), gr.update()
+
+        # -----------------------------------------------------------------------
+        # FIX: Save best-validation model weights
+        # -----------------------------------------------------------------------
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), best_model_path)
+            log_text += f"  ✅ New best val F1: {best_val_f1 * 100:.2f}% — model saved.\n"
+            yield log_text, gr.update(), gr.update()
         
-        # Save epoch checkpoint in case environment disconnects
+        # Save epoch checkpoint (for crash recovery)
         try:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'history': history,
                 'config': {
                     'architecture': architecture,
@@ -408,10 +545,8 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         except Exception as e:
             print(f"Error saving checkpoint: {e}")
         
-    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
+    # Save final metrics JSON (best weights were already saved above)
     metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
-    
-    torch.save(model.state_dict(), model_path)
     with open(metrics_path, "w") as f:
         json.dump(history, f)
         
@@ -422,13 +557,23 @@ def train_model(model_name, architecture, epochs, batch_size, selected_diseases,
         except Exception as e:
             print(f"Error removing checkpoint: {e}")
             
-    log_text += f"Training complete! Model saved as {model_name}.pth\n"
+    log_text += f"\nTraining complete! Best val F1: {best_val_f1*100:.2f}%. Model saved as {model_name}.pth\n"
     yield log_text, update_model_dropdown(), update_checkpoint_dropdown()
 
+# ---------------------------------------------------------------------------
+# FIX: update_model_dropdown — exclude checkpoint files
+# ---------------------------------------------------------------------------
 def update_model_dropdown():
-    models_list = [f.replace(".pth", "") for f in os.listdir(MODELS_DIR) if f.endswith(".pth")]
+    models_list = [
+        f.replace(".pth", "")
+        for f in os.listdir(MODELS_DIR)
+        if f.endswith(".pth") and not f.endswith("_checkpoint.pth")
+    ]
     return gr.Dropdown(choices=models_list, label="Select Model")
 
+# ---------------------------------------------------------------------------
+# Performance plot — now shows train AND val curves
+# ---------------------------------------------------------------------------
 def get_performance(model_name):
     if not model_name:
         return None, "No model selected."
@@ -440,56 +585,52 @@ def get_performance(model_name):
     with open(metrics_path, "r") as f:
         history = json.load(f)
         
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
-    epochs = range(1, len(history["loss"]) + 1)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    epochs_range = range(1, len(history["loss"]) + 1)
     
-    ax1.plot(epochs, history["loss"], marker='o', color='blue', linewidth=2)
-    ax1.set_title("Training Loss")
+    # Loss subplot
+    ax1.plot(epochs_range, history["loss"], marker='o', color='royalblue', linewidth=2, label="Train Loss")
+    if "val_loss" in history and history["val_loss"]:
+        ax1.plot(epochs_range, history["val_loss"], marker='s', color='tomato', linewidth=2, linestyle='--', label="Val Loss")
+    ax1.set_title("Loss")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss")
+    ax1.legend()
     ax1.grid(True, linestyle='--', alpha=0.5)
     
-    # Backward compatibility: Check if this was trained under the old scheme
-    if "f1_score" in history:
-        # Plot F1-score as primary line, and show binary accuracy as comparison
-        ax2.plot(epochs, [f * 100 for f in history["f1_score"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
-        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='x', linestyle='--', color='gray', alpha=0.6, label="Binary Accuracy (Old)")
-        final_acc = history["f1_score"][-1]
-    else:
-        # New scheme: history["accuracy"] is F1-score itself!
-        ax2.plot(epochs, [a * 100 for a in history["accuracy"]], marker='o', color='green', linewidth=2, label="Accuracy (F1-Score)")
-        final_acc = history["accuracy"][-1]
-        
-    ax2.set_title("Training Accuracy (F1-Score)")
+    # F1-Score subplot
+    train_f1_key = "f1_score" if "f1_score" in history else "accuracy"
+    val_f1_key   = "val_f1_score" if "val_f1_score" in history else "val_accuracy"
+    train_f1 = history.get(train_f1_key, [])
+    val_f1   = history.get(val_f1_key, [])
+
+    if train_f1:
+        ax2.plot(epochs_range, [f * 100 for f in train_f1], marker='o', color='royalblue', linewidth=2, label="Train F1")
+    if val_f1:
+        ax2.plot(range(1, len(val_f1) + 1), [f * 100 for f in val_f1], marker='s', color='tomato', linewidth=2, linestyle='--', label="Val F1")
+    ax2.set_title("F1-Score")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Accuracy (%)")
+    ax2.set_ylabel("F1-Score (%)")
     ax2.legend(loc="lower right")
     ax2.grid(True, linestyle='--', alpha=0.5)
     
     plt.tight_layout()
     
-    final_loss = history["loss"][-1]
+    final_loss    = history["loss"][-1]
+    final_val_f1  = val_f1[-1] if val_f1 else None
+    best_val_f1   = max(val_f1) if val_f1 else None
     arch = history.get("architecture", "Unknown")
-    stats = f"Architecture: {arch} | Final Loss: {final_loss:.4f} | Final Accuracy (F1-Score): {final_acc*100:.2f}%"
+    
+    stats  = f"Architecture: {arch}\n"
+    stats += f"Final Train Loss: {final_loss:.4f}\n"
+    if best_val_f1 is not None:
+        stats += f"Best Val F1: {best_val_f1*100:.2f}%  |  Final Val F1: {final_val_f1*100:.2f}%\n"
     
     return fig, stats
 
-def evaluate_model(model, dataloader, device):
-    model.eval()
-    tp, fp, fn = 0, 0, 0
-    with torch.no_grad():
-        for inputs, labels in dataloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            preds = (torch.sigmoid(outputs) > 0.5).float()
-            tp += ((preds == 1) & (labels == 1)).float().sum().item()
-            fp += ((preds == 1) & (labels == 0)).float().sum().item()
-            fn += ((preds == 0) & (labels == 1)).float().sum().item()
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-    return f1
-
+# ---------------------------------------------------------------------------
+# OPTUNA TUNING  (added patient-level split, random sampling, pruner)
+# ---------------------------------------------------------------------------
 def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_architectures, selected_optimizers, selected_batch_sizes, selected_diseases, balanced_sampling, balanced_size, progress=gr.Progress()):
     if optuna is None:
         yield "Error: Optuna library is not installed. Please run 'pip install optuna' to enable hyperparameter tuning.", gr.update(), None, gr.update()
@@ -511,11 +652,11 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
         yield "Error: Please select at least one batch size to search over.", gr.update(), None, gr.update()
         return
 
-    log_text = f"Starting Optuna Hyperparameter Optimization Study '{study_name}'...\n"
+    log_text  = f"Starting Optuna Hyperparameter Optimization Study '{study_name}'...\n"
     log_text += f"Config: Trials={num_trials}, Epochs per Trial={epochs_per_trial}\n"
-    log_text += f"Architectures to evaluate: {selected_architectures}\n"
-    log_text += f"Optimizers to evaluate: {selected_optimizers}\n"
-    log_text += f"Batch Sizes to evaluate: {selected_batch_sizes}\n"
+    log_text += f"Architectures: {selected_architectures}\n"
+    log_text += f"Optimizers: {selected_optimizers}\n"
+    log_text += f"Batch Sizes: {selected_batch_sizes}\n"
     yield log_text, gr.update(), None, gr.update()
     
     df = pd.read_csv(CSV_PATH)
@@ -524,14 +665,14 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
     if selected_diseases:
         if balanced_sampling:
             sample_size = int(balanced_size)
-            log_text += f"Using Balanced Sampling: {sample_size} images per selected disease...\n"
+            log_text += f"Using Balanced Sampling: {sample_size} images per disease...\n"
             yield log_text, gr.update(), None, gr.update()
             dfs = []
             for d in selected_diseases:
-                d_df = df[df['Finding Labels'].str.contains(d)].copy()
+                d_df = df[df['Finding Labels'].str.contains(d, regex=False)].copy()
                 sample_n = min(len(d_df), sample_size)
                 if sample_n > 0:
-                    dfs.append(d_df.sort_values(['Patient ID', 'Follow-up #']).head(sample_n))
+                    dfs.append(d_df.sample(n=sample_n, random_state=42))
             if dfs:
                 df = pd.concat(dfs).drop_duplicates().reset_index(drop=True)
             else:
@@ -543,47 +684,31 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
             mask = df['Finding Labels'].apply(lambda x: any(d in x for d in selected_diseases))
             df = df[mask].reset_index(drop=True)
     else:
-        log_text += f"No target diseases specified. Running optimization on full dataset of {len(df)} images...\n"
+        log_text += f"No diseases specified. Using full dataset of {len(df)} images...\n"
         yield log_text, gr.update(), None, gr.update()
         
-    if len(df) < 5:
-        yield log_text + f"Error: Dataset size too small ({len(df)} images). Please select more diseases or increase sampling size.\n", gr.update(), None, gr.update()
+    if len(df) < 10:
+        yield log_text + f"Error: Dataset too small ({len(df)} images).\n", gr.update(), None, gr.update()
         return
-        
-    # Train/Validation Split (80% / 20%)
-    train_df = df.sample(frac=0.8, random_state=42)
-    val_df = df.drop(train_df.index).reset_index(drop=True)
-    train_df = train_df.reset_index(drop=True)
+
+    # FIX: Patient-level split for Optuna too
+    if 'Patient ID' in df.columns:
+        train_df, val_df = patient_split(df, val_frac=0.2, seed=42)
+    else:
+        train_df = df.sample(frac=0.8, random_state=42).reset_index(drop=True)
+        val_df   = df.drop(train_df.index).reset_index(drop=True)
     
-    log_text += f"Split details: {len(train_df)} training samples, {len(val_df)} validation samples.\n"
+    log_text += f"Split: {len(train_df)} train | {len(val_df)} val (patient-level).\n"
     yield log_text, gr.update(), None, gr.update()
-    
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    log_text += f"Running on device: {device}\n"
+    log_text += f"Running on: {device}\n"
     yield log_text, gr.update(), None, gr.update()
     
-    # Calculate loss weights
-    pos_counts = torch.zeros(len(ALL_LABELS))
-    for labels_str in train_df['Finding Labels']:
-        labels = labels_str.split('|')
-        for i, l in enumerate(ALL_LABELS):
-            if l in labels:
-                pos_counts[i] += 1
-                
-    pos_weight = torch.ones(len(ALL_LABELS))
-    for i in range(len(ALL_LABELS)):
-        if pos_counts[i] > 0:
-            pos_weight[i] = min((len(train_df) - pos_counts[i]) / pos_counts[i], 10.0)
-            
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    pos_weight = compute_pos_weight(train_df['Finding Labels'], device)
+    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
-    # Optuna study Setup
+    # Optuna study setup with median pruner
     db_path = os.path.abspath(os.path.join(MODELS_DIR, "optuna_studies.db"))
     db_path_url = db_path.replace(os.sep, '/')
     storage_url = f"sqlite:///{db_path_url}"
@@ -592,125 +717,52 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
         study_name=study_name,
         storage=storage_url,
         direction="maximize",
-        load_if_exists=True
+        load_if_exists=True,
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=2, n_warmup_steps=1)
     )
     
     completed_before = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-    log_text += f"Loaded study '{study_name}' from SQLite storage.\n"
-    if completed_before > 0:
-        log_text += f"Found {completed_before} completed trials in this study. Resuming...\n"
+    log_text += f"Loaded study '{study_name}'. Completed trials so far: {completed_before}.\n"
     yield log_text, gr.update(), None, gr.update()
     
     for trial_idx in range(int(num_trials)):
         trial = study.ask()
         trial_num = trial.number
         
-        arch = trial.suggest_categorical("architecture", selected_architectures)
-        opt_name = trial.suggest_categorical("optimizer", selected_optimizers)
-        b_size = int(trial.suggest_categorical("batch_size", selected_batch_sizes))
-        dropout_val = trial.suggest_float("dropout", 0.1, 0.5)
-        
-        classifier_lr = trial.suggest_float("classifier_lr", 1e-4, 1e-2, log=True)
-        if arch != "Simple CNN":
-            backbone_lr = trial.suggest_float("backbone_lr", 1e-6, 1e-4, log=True)
-        else:
-            backbone_lr = 0.0
+        arch           = trial.suggest_categorical("architecture", selected_architectures)
+        opt_name       = trial.suggest_categorical("optimizer", selected_optimizers)
+        b_size         = int(trial.suggest_categorical("batch_size", selected_batch_sizes))
+        dropout_val    = trial.suggest_float("dropout", 0.1, 0.5)
+        classifier_lr  = trial.suggest_float("classifier_lr", 1e-4, 1e-2, log=True)
+        backbone_lr    = trial.suggest_float("backbone_lr", 1e-6, 1e-4, log=True) if arch != "Simple CNN" else 0.0
             
-        t_log = f"\n--- [Trial {trial_num+1}/{completed_before + num_trials}] ---\n"
-        t_log += f"Parameters:\n"
-        t_log += f"  - Architecture: {arch}\n"
-        t_log += f"  - Optimizer: {opt_name}\n"
-        t_log += f"  - Batch Size: {b_size}\n"
-        t_log += f"  - Dropout: {dropout_val:.2f}\n"
-        t_log += f"  - Classifier LR: {classifier_lr:.2e}\n"
-        if arch != "Simple CNN":
-            t_log += f"  - Backbone LR: {backbone_lr:.2e}\n"
-        
-        log_text += t_log + "Training and validating model...\n"
+        t_log  = f"\n--- [Trial {trial_num+1}/{completed_before + num_trials}] ---\n"
+        t_log += f"  Arch: {arch} | Opt: {opt_name} | BS: {b_size} | Dropout: {dropout_val:.2f} | LR cls: {classifier_lr:.2e}\n"
+        log_text += t_log
         yield log_text, gr.update(), None, gr.update()
         
-        train_dataset = NIHDataset(train_df, transform=transform)
-        val_dataset = NIHDataset(val_df, transform=transform)
-        train_loader = DataLoader(train_dataset, batch_size=b_size, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=b_size, shuffle=False)
+        train_dataset = NIHDataset(train_df, transform=TRAIN_TRANSFORM)
+        val_dataset   = NIHDataset(val_df,   transform=INFER_TRANSFORM)
+        train_loader  = DataLoader(train_dataset, batch_size=b_size, shuffle=True,  num_workers=0)
+        val_loader    = DataLoader(val_dataset,   batch_size=b_size, shuffle=False, num_workers=0)
         
         model = get_model(arch)
         
-        # Inject dropout
+        # Inject trial dropout
         if arch == "ResNet-18":
             model.fc = nn.Sequential(
                 nn.Dropout(dropout_val),
                 nn.Linear(model.fc[1].in_features, len(ALL_LABELS))
             )
-        elif arch == "MobileNet-V2":
-            model.classifier[0] = nn.Dropout(dropout_val)
-        elif arch == "DenseNet-121":
-            model.classifier[0] = nn.Dropout(dropout_val)
-        elif arch == "Simple CNN":
-            model.classifier[0] = nn.Dropout(dropout_val)
-        elif arch == "Hybrid Model":
+        elif arch in ("MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"):
             model.classifier[0] = nn.Dropout(dropout_val)
             
         model.to(device)
-        
         for param in model.parameters():
             param.requires_grad = True
+
+        optimizer = build_optimizer(model, arch, opt_name, backbone_lr, classifier_lr)
             
-        if arch == "Simple CNN":
-            params = model.parameters()
-            if opt_name == "Adam":
-                optimizer = torch.optim.Adam(params, lr=classifier_lr)
-            elif opt_name == "AdamW":
-                optimizer = torch.optim.AdamW(params, lr=classifier_lr)
-            elif opt_name == "SGD":
-                optimizer = torch.optim.SGD(params, lr=classifier_lr, momentum=0.9)
-            elif opt_name == "RMSprop":
-                optimizer = torch.optim.RMSprop(params, lr=classifier_lr)
-            elif opt_name == "Adagrad":
-                optimizer = torch.optim.Adagrad(params, lr=classifier_lr)
-            else:
-                optimizer = torch.optim.Adam(params, lr=classifier_lr)
-        else:
-            backbone_params = []
-            classifier_params = []
-            classifier_layer_name = "fc" if arch == "ResNet-18" else "classifier"
-            for name, param in model.named_parameters():
-                if classifier_layer_name in name:
-                    classifier_params.append(param)
-                else:
-                    backbone_params.append(param)
-                    
-            if opt_name == "Adam":
-                optimizer = torch.optim.Adam([
-                    {"params": backbone_params, "lr": backbone_lr},
-                    {"params": classifier_params, "lr": classifier_lr}
-                ])
-            elif opt_name == "AdamW":
-                optimizer = torch.optim.AdamW([
-                    {"params": backbone_params, "lr": backbone_lr},
-                    {"params": classifier_params, "lr": classifier_lr}
-                ])
-            elif opt_name == "SGD":
-                optimizer = torch.optim.SGD([
-                    {"params": backbone_params, "lr": backbone_lr},
-                    {"params": classifier_params, "lr": classifier_lr}
-                ], momentum=0.9)
-            elif opt_name == "RMSprop":
-                optimizer = torch.optim.RMSprop([
-                    {"params": backbone_params, "lr": backbone_lr},
-                    {"params": classifier_params, "lr": classifier_lr}
-                ])
-            elif opt_name == "Adagrad":
-                optimizer = torch.optim.Adagrad([
-                    {"params": backbone_params, "lr": backbone_lr},
-                    {"params": classifier_params, "lr": classifier_lr}
-                ])
-            else:
-                optimizer = torch.optim.Adam([
-                    {"params": backbone_params, "lr": backbone_lr},
-                    {"params": classifier_params, "lr": classifier_lr}
-                ])
-                
         best_val_f1 = 0.0
         for epoch in progress.tqdm(range(int(epochs_per_trial)), desc=f"Trial {trial_num+1} Epochs"):
             model.train()
@@ -718,29 +770,35 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
                 inputs, labels = inputs.to(device), labels.to(device)
                 optimizer.zero_grad()
                 outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                loss    = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
                 
-            val_f1 = evaluate_model(model, val_loader, device)
+            val_f1, _ = evaluate_model(model, val_loader, device)
             if val_f1 > best_val_f1:
                 best_val_f1 = val_f1
-                
-        study.tell(trial, best_val_f1)
-        log_text += f"Trial {trial_num+1} Completed. Best Validation F1-Score: {best_val_f1 * 100:.2f}%\n"
-        yield log_text, gr.update(), None, gr.update()
+
+            # Report intermediate for pruning
+            trial.report(val_f1, epoch)
+            if trial.should_prune():
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                log_text += f"  Trial {trial_num+1} pruned at epoch {epoch+1}.\n"
+                yield log_text, gr.update(), None, gr.update()
+                break
+        else:
+            study.tell(trial, best_val_f1)
+            log_text += f"  Trial {trial_num+1} done. Best Val F1: {best_val_f1 * 100:.2f}%\n"
+            yield log_text, gr.update(), None, gr.update()
         
     best_trial = study.best_trial
     log_text += f"\n=====================================\n"
     log_text += f"OPTIMIZATION COMPLETE!\n"
-    log_text += f"Best Trial Number: {best_trial.number + 1}\n"
-    log_text += f"Best Validation F1-Score: {best_trial.value * 100:.2f}%\n"
-    log_text += f"Best Parameters:\n"
+    log_text += f"Best Trial: {best_trial.number + 1}  |  Best Val F1: {best_trial.value * 100:.2f}%\n"
+    log_text += "Best Parameters:\n"
     for k, v in best_trial.params.items():
         log_text += f"  - {k}: {v}\n"
-    log_text += f"=====================================\n"
+    log_text += "=====================================\n"
     
-    # Generate History Plot
     fig, ax = plt.subplots(figsize=(6.5, 4))
     trial_nums = [t.number + 1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     f1s = [t.value * 100 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -760,7 +818,7 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
             "best_params": best_trial.params
         }, f, indent=4)
         
-    results_summary = f"Best Validation F1-Score: {best_trial.value * 100:.2f}%\n\nBest Hyperparameters:\n"
+    results_summary  = f"Best Validation F1-Score: {best_trial.value * 100:.2f}%\n\nBest Hyperparameters:\n"
     for k, v in best_trial.params.items():
         if isinstance(v, float):
             results_summary += f"{k}: {v:.2e}\n" if v < 1e-3 else f"{k}: {v:.4f}\n"
@@ -769,13 +827,16 @@ def optuna_tune_model(study_name, num_trials, epochs_per_trial, selected_archite
             
     yield log_text, fig, results_summary, gr.update(choices=get_optuna_studies(), value=study_name)
 
+# ---------------------------------------------------------------------------
+# INFERENCE  (consistent INFER_TRANSFORM, same as val)
+# ---------------------------------------------------------------------------
 def predict_image(image, model_name):
     if image is None:
         return "Please upload an image."
     if not model_name:
         return "Please select a trained model from Performance section."
         
-    model_path = os.path.join(MODELS_DIR, f"{model_name}.pth")
+    model_path   = os.path.join(MODELS_DIR, f"{model_name}.pth")
     metrics_path = os.path.join(MODELS_DIR, f"{model_name}_metrics.json")
     if not os.path.exists(model_path):
         return "Model file not found."
@@ -790,28 +851,27 @@ def predict_image(image, model_name):
             pass
         
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = get_model(arch)
-    load_compat_state_dict(model, torch.load(model_path, map_location=device))
+    model  = get_model(arch)
+    load_compat_state_dict(model, torch.load(model_path, map_location=device, weights_only=True))
     model.to(device)
     model.eval()
     
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
+    # FIX: Use the same INFER_TRANSFORM as validation — no augmentation
     image = image.convert('RGB')
-    img_t = transform(image).unsqueeze(0).to(device)
+    img_t = INFER_TRANSFORM(image).unsqueeze(0).to(device)
     
     with torch.no_grad():
         outputs = model(img_t)
-        probs = torch.sigmoid(outputs).squeeze().cpu().numpy()
+        probs   = torch.sigmoid(outputs).squeeze().cpu().numpy()
         if probs.ndim == 0:
             probs = [probs.item()]
         
     results = {label: float(prob) for label, prob in zip(ALL_LABELS, probs)}
     return results
 
+# ---------------------------------------------------------------------------
+# Optuna study utilities
+# ---------------------------------------------------------------------------
 def get_optuna_studies():
     if optuna is None:
         return []
@@ -840,7 +900,7 @@ def get_optuna_study_details(study_name):
     except Exception as e:
         return f"Error loading study: {e}", None, None
         
-    stats = f"Study Name: {study_name}\n"
+    stats  = f"Study Name: {study_name}\n"
     stats += f"Total Trials: {len(study.trials)}\n"
     
     completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -862,15 +922,12 @@ def get_optuna_study_details(study_name):
     trial_data = []
     for t in study.trials:
         row = {
-            "Trial": t.number + 1,
-            "State": t.state.name,
+            "Trial":       t.number + 1,
+            "State":       t.state.name,
             "F1-Score (%)": round(t.value * 100, 2) if t.value is not None else None,
         }
         for k, v in t.params.items():
-            if isinstance(v, float):
-                row[k] = round(v, 6)
-            else:
-                row[k] = v
+            row[k] = round(v, 6) if isinstance(v, float) else v
         trial_data.append(row)
         
     df = pd.DataFrame(trial_data) if trial_data else pd.DataFrame()
@@ -879,7 +936,7 @@ def get_optuna_study_details(study_name):
     if len(completed_trials) > 0:
         fig, ax = plt.subplots(figsize=(7, 4))
         trial_nums = [t.number + 1 for t in completed_trials]
-        f1s = [t.value * 100 for t in completed_trials]
+        f1s        = [t.value * 100 for t in completed_trials]
         ax.plot(trial_nums, f1s, marker='o', color='purple', linewidth=2, label="Trial F1")
         
         running_max = []
@@ -898,6 +955,9 @@ def get_optuna_study_details(study_name):
         
     return stats, df, fig
 
+# ---------------------------------------------------------------------------
+# Checkpoint utilities
+# ---------------------------------------------------------------------------
 def get_active_checkpoints():
     if not os.path.exists(MODELS_DIR):
         return []
@@ -907,13 +967,13 @@ def get_active_checkpoints():
             model_name = f.replace("_checkpoint.pth", "")
             path = os.path.join(MODELS_DIR, f)
             try:
-                ckpt = torch.load(path, map_location='cpu')
-                epoch = ckpt.get('epoch', 0)
+                ckpt   = torch.load(path, map_location='cpu', weights_only=False)
+                epoch  = ckpt.get('epoch', 0)
                 config = ckpt.get('config', {})
-                arch = config.get('architecture', 'Unknown')
+                arch   = config.get('architecture', 'Unknown')
                 epochs = config.get('epochs', '?')
                 checkpoints.append((model_name, f"{model_name} (Arch: {arch}, Epoch: {epoch+1}/{epochs})"))
-            except Exception as e:
+            except Exception:
                 checkpoints.append((model_name, f"{model_name} (Unknown state)"))
     return checkpoints
 
@@ -921,30 +981,22 @@ def load_checkpoint_info_to_ui(selected_checkpoint_display):
     if not selected_checkpoint_display or selected_checkpoint_display == "None (Start New)":
         return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
     
-    model_name = selected_checkpoint_display.split(" ")[0]
+    model_name      = selected_checkpoint_display.split(" ")[0]
     checkpoint_path = os.path.join(MODELS_DIR, f"{model_name}_checkpoint.pth")
     if not os.path.exists(checkpoint_path):
         return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
         
     try:
-        ckpt = torch.load(checkpoint_path, map_location='cpu')
-        cfg = ckpt.get('config', {})
-        arch = cfg.get('architecture', gr.update())
-        epochs = cfg.get('epochs', gr.update())
-        batch_size = cfg.get('batch_size', gr.update())
+        ckpt             = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        cfg              = ckpt.get('config', {})
+        arch             = cfg.get('architecture', gr.update())
+        epochs           = cfg.get('epochs', gr.update())
+        batch_size       = cfg.get('batch_size', gr.update())
         selected_diseases = cfg.get('selected_diseases', gr.update())
         balanced_sampling = cfg.get('balanced_sampling', gr.update())
-        balanced_size = cfg.get('balanced_size', gr.update())
+        balanced_size    = cfg.get('balanced_size', gr.update())
         
-        return (
-            model_name,
-            arch,
-            epochs,
-            batch_size,
-            balanced_sampling,
-            balanced_size,
-            selected_diseases
-        )
+        return (model_name, arch, epochs, batch_size, balanced_sampling, balanced_size, selected_diseases)
     except Exception as e:
         print(f"Error loading checkpoint metadata to UI: {e}")
         return model_name, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
@@ -953,6 +1005,9 @@ def update_checkpoint_dropdown():
     ckpt_list = ["None (Start New)"] + [disp for _, disp in get_active_checkpoints()]
     return gr.Dropdown(choices=ckpt_list, value="None (Start New)", label="Resume Training from Checkpoint")
 
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
 with gr.Blocks() as demo:
     gr.Markdown("# NIH Chest X-ray Model Trainer & Predictor")
     gr.Markdown("Switch between default and dark mode using your browser's theme settings, or use Gradio's built-in toggle.")
@@ -962,54 +1017,54 @@ with gr.Blocks() as demo:
             checkpoint_dropdown = gr.Dropdown(choices=["None (Start New)"], value="None (Start New)", label="Resume Training from Checkpoint")
             refresh_checkpoint_btn = gr.Button("🔄 Refresh Checkpoints", size="sm")
         with gr.Row():
-            model_name_input = gr.Textbox(label="Model Name (optional)", placeholder="my_resnet")
-            architecture_input = gr.Dropdown(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value="ResNet-18", label="Base Architecture")
+            model_name_input    = gr.Textbox(label="Model Name (optional)", placeholder="my_resnet")
+            architecture_input  = gr.Dropdown(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value="ResNet-18", label="Base Architecture")
         with gr.Row():
-            epochs_input = gr.Slider(minimum=1, maximum=50, value=3, step=1, label="Epochs")
+            epochs_input     = gr.Slider(minimum=1, maximum=50, value=3, step=1, label="Epochs")
             batch_size_input = gr.Slider(minimum=4, maximum=128, value=16, step=4, label="Batch Size")
         with gr.Row():
-            balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
+            balanced_input      = gr.Checkbox(label="Enable Balanced Sampling", value=True)
             balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200", "500", "1000", "2000", "5000"], value="100", label="Balanced Sample Size (images per selected disease)", visible=True)
         with gr.Row():
             with gr.Column():
                 diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases (Select at least one for Balanced Sampling)", info="Select specific diseases to train on a targeted subset.")
                 with gr.Row():
-                    select_all_btn = gr.Button("Select All")
+                    select_all_btn   = gr.Button("Select All")
                     deselect_all_btn = gr.Button("Clear Selection")
             
-        train_btn = gr.Button("Train Model", variant="primary")
+        train_btn    = gr.Button("Train Model", variant="primary")
         train_output = gr.Textbox(label="Live Terminal Output", lines=10, max_lines=20)
         
     with gr.Tab("2. Performance"):
-        refresh_btn = gr.Button("Refresh Models")
+        refresh_btn    = gr.Button("Refresh Models")
         model_dropdown = gr.Dropdown(choices=[], label="Select Model")
         with gr.Row():
-            perf_plot = gr.Plot(label="Performance Metrics")
+            perf_plot  = gr.Plot(label="Performance Metrics (Train vs Val)")
             perf_stats = gr.Textbox(label="Final Stats")
             
     with gr.Tab("3. Inference"):
         infer_model_dropdown = gr.Dropdown(choices=[], label="Select Model for Inference")
         with gr.Row():
-            image_input = gr.Image(type="pil", label="Upload X-ray Image")
+            image_input       = gr.Image(type="pil", label="Upload X-ray Image")
             prediction_output = gr.Label(num_top_classes=5, label="Disease Predictions")
         predict_btn = gr.Button("Predict Disease", variant="primary")
         
     with gr.Tab("4. Hyperparameter Tuning (Optuna)"):
-        gr.Markdown("### Optimize hyper-parameters using Optuna. The dataset is split 80% for training and 20% for validation evaluation.")
+        gr.Markdown("### Optimize hyper-parameters using Optuna. Dataset is split 80% train / 20% val at patient level.")
         with gr.Row():
             with gr.Column():
                 optuna_study_name_input = gr.Textbox(label="Study Name (for resuming/saving)", value="optuna_study", placeholder="optuna_study")
-                optuna_trials_input = gr.Slider(minimum=1, maximum=50, value=5, step=1, label="Number of Trials")
-                optuna_epochs_input = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Epochs per Trial")
-                optuna_archs_input = gr.CheckboxGroup(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value=["ResNet-18", "MobileNet-V2"], label="Base Architectures to Search")
-                optuna_opts_input = gr.CheckboxGroup(choices=["Adam", "AdamW", "SGD", "RMSprop", "Adagrad"], value=["Adam", "AdamW", "SGD"], label="Optimizers to Search")
-                optuna_batch_input = gr.CheckboxGroup(choices=["8", "16", "32"], value=["16", "32"], label="Batch Sizes to Search")
+                optuna_trials_input     = gr.Slider(minimum=1, maximum=50, value=5, step=1, label="Number of Trials")
+                optuna_epochs_input     = gr.Slider(minimum=1, maximum=10, value=2, step=1, label="Epochs per Trial")
+                optuna_archs_input      = gr.CheckboxGroup(choices=["ResNet-18", "MobileNet-V2", "DenseNet-121", "Simple CNN", "Hybrid Model"], value=["ResNet-18", "MobileNet-V2"], label="Base Architectures to Search")
+                optuna_opts_input       = gr.CheckboxGroup(choices=["Adam", "AdamW", "SGD", "RMSprop", "Adagrad"], value=["Adam", "AdamW", "SGD"], label="Optimizers to Search")
+                optuna_batch_input      = gr.CheckboxGroup(choices=["8", "16", "32"], value=["16", "32"], label="Batch Sizes to Search")
             with gr.Column():
-                optuna_balanced_input = gr.Checkbox(label="Enable Balanced Sampling", value=True)
+                optuna_balanced_input      = gr.Checkbox(label="Enable Balanced Sampling", value=True)
                 optuna_balanced_size_input = gr.Dropdown(choices=["50", "100", "150", "200", "500", "1000", "2000", "5000"], value="100", label="Balanced Sample Size (images per selected disease)")
-                optuna_diseases_input = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases", info="Select specific diseases to train on a targeted subset.")
+                optuna_diseases_input      = gr.CheckboxGroup(choices=ALL_LABELS, label="Target Diseases", info="Select specific diseases to train on a targeted subset.")
                 with gr.Row():
-                    optuna_select_all_btn = gr.Button("Select All")
+                    optuna_select_all_btn   = gr.Button("Select All")
                     optuna_deselect_all_btn = gr.Button("Clear Selection")
                     
         optuna_tune_btn = gr.Button("Start Hyperparameter Optimization", variant="primary")
@@ -1017,14 +1072,14 @@ with gr.Blocks() as demo:
         with gr.Row():
             optuna_log_output = gr.Textbox(label="Optimization Terminal Output", lines=10, max_lines=20)
             with gr.Column():
-                optuna_plot_output = gr.Plot(label="Optimization History Graph")
+                optuna_plot_output   = gr.Plot(label="Optimization History Graph")
                 optuna_params_output = gr.Textbox(label="Best Hyperparameters Found", lines=8)
 
     with gr.Tab("5. Hyperparameter Tuning Results"):
         gr.Markdown("### View hyperparameter tuning history and details of completed studies.")
         with gr.Row():
             results_study_dropdown = gr.Dropdown(choices=[], label="Select Study")
-            refresh_studies_btn = gr.Button("🔄 Refresh Studies", size="sm")
+            refresh_studies_btn    = gr.Button("🔄 Refresh Studies", size="sm")
             
         with gr.Row():
             with gr.Column(scale=1):
@@ -1035,6 +1090,9 @@ with gr.Blocks() as demo:
         gr.Markdown("### All Trial History")
         results_trials_df = gr.Dataframe(label="Trials List", interactive=False)
                 
+    # -----------------------------------------------------------------------
+    # Event wiring
+    # -----------------------------------------------------------------------
     def toggle_balanced_size(balanced):
         return gr.update(visible=balanced)
         
@@ -1064,13 +1122,14 @@ with gr.Blocks() as demo:
     )
     refresh_checkpoint_btn.click(fn=update_checkpoint_dropdown, inputs=None, outputs=[checkpoint_dropdown])
     
+    # FIX: on_refresh returns 4 values — wire all 4 outputs
     def on_refresh():
-        models_dropdown = update_model_dropdown()
-        checkpoint_dropdown_update = update_checkpoint_dropdown()
-        studies_dropdown = gr.Dropdown(choices=get_optuna_studies(), label="Select Study")
-        return models_dropdown, models_dropdown, checkpoint_dropdown_update, studies_dropdown
+        models_dd       = update_model_dropdown()
+        ckpt_dd         = update_checkpoint_dropdown()
+        studies_dd      = gr.Dropdown(choices=get_optuna_studies(), label="Select Study")
+        return models_dd, models_dd, ckpt_dd, studies_dd
         
-    refresh_btn.click(fn=on_refresh, inputs=None, outputs=[model_dropdown, infer_model_dropdown])
+    refresh_btn.click(fn=on_refresh, inputs=None, outputs=[model_dropdown, infer_model_dropdown, checkpoint_dropdown, results_study_dropdown])
     
     demo.load(fn=on_refresh, inputs=None, outputs=[model_dropdown, infer_model_dropdown, checkpoint_dropdown, results_study_dropdown])
     
