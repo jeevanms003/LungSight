@@ -175,11 +175,14 @@ class HybridModel(nn.Module):
 def get_model(model_type="ResNet-18", num_classes=len(ALL_LABELS)):
     if model_type == "MobileNet-V2":
         model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
-        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+        model.classifier[1] = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(model.classifier[1].in_features, num_classes)
+        )
     elif model_type == "DenseNet-121":
         model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
         model.classifier = nn.Sequential(
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(model.classifier.in_features, num_classes)
         )
     elif model_type == "Simple CNN":
@@ -189,7 +192,7 @@ def get_model(model_type="ResNet-18", num_classes=len(ALL_LABELS)):
     else: # Default ResNet-18
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         model.fc = nn.Sequential(
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(model.fc.in_features, num_classes)
         )
     return model
@@ -263,9 +266,9 @@ def patient_split(df, val_frac=0.2, seed=42):
     return train_df, val_df
 
 # ---------------------------------------------------------------------------
-# Helper: build optimizer with differential LR
+# Helper: build optimizer with differential LR & L2 regularization
 # ---------------------------------------------------------------------------
-def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-4, classifier_lr=1e-3):
+def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-4, classifier_lr=1e-3, weight_decay=1e-4):
     backbone_params = []
     classifier_params = []
     classifier_layer_name = "fc" if architecture == "ResNet-18" else "classifier"
@@ -284,17 +287,17 @@ def build_optimizer(model, architecture, opt_name="Adam", backbone_lr=1e-4, clas
         ]
 
     opt_map = {
-        "Adam":    torch.optim.Adam,
-        "AdamW":   torch.optim.AdamW,
-        "RMSprop": torch.optim.RMSprop,
-        "Adagrad": torch.optim.Adagrad,
+        "Adam":    lambda p: torch.optim.Adam(p, weight_decay=weight_decay),
+        "AdamW":   lambda p: torch.optim.AdamW(p, weight_decay=weight_decay),
+        "RMSprop": lambda p: torch.optim.RMSprop(p, weight_decay=weight_decay),
+        "Adagrad": lambda p: torch.optim.Adagrad(p, weight_decay=weight_decay),
     }
     if opt_name in opt_map:
         return opt_map[opt_name](pg)
     elif opt_name == "SGD":
-        return torch.optim.SGD(pg, momentum=0.9)
+        return torch.optim.SGD(pg, momentum=0.9, weight_decay=weight_decay)
     else:
-        return torch.optim.Adam(pg)
+        return torch.optim.Adam(pg, weight_decay=weight_decay)
 
 # ---------------------------------------------------------------------------
 # evaluate_model  (used by Optuna and train loop)
